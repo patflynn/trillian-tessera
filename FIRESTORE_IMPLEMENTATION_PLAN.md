@@ -4,74 +4,85 @@
 
 This document outlines the plan to implement a Google Firestore storage backend for Trillian Tessera. The implementation will follow the patterns established by existing storage backends while leveraging Firestore's unique capabilities.
 
-## Implementation Tasks
+## Implementation Progress
 
-### 1. Setup Infrastructure and Basics
+### Completed Tasks
 
-- Create directory structure at `storage/firestore/` following similar patterns to `storage/gcp/`
-- Create README.md with overview and usage instructions
-- Create basic Firestore client wrapper and configuration
+- ✅ Created directory structure at `storage/firestore/` following similar patterns to `storage/gcp/`
+- ✅ Created README.md with overview and usage instructions
+- ✅ Created basic Firestore client wrapper and configuration
+- ✅ Implemented `Driver` interface with `Appender` and `MigrationWriter` methods
+- ✅ Created `Storage` struct to manage Firestore connection and operations
+- ✅ Defined document schema for tiles, entry bundles, and checkpoints
+- ✅ Defined document path structure for efficient retrieval
+- ✅ Implemented version checking and initialization
+- ✅ Implemented basic read operations (tiles, entries, checkpoints)
+- ✅ Implemented scaffolding for write operations
+- ✅ Implemented basic concurrency control structure (locks, background jobs)
+- ✅ Fixed build issues and made tests pass
+- ✅ Implemented `StreamEntries` functionality using the storage helper
 
-### 2. Core Storage Implementation
+### Remaining Tasks
 
-- Implement `Driver` interface with `Appender` and `MigrationWriter` methods
-- Create `Storage` struct to manage Firestore connection and operations
-- Implement document schema for tiles, entry bundles, and checkpoints
-- Define document path structure for efficient retrieval
-- Implement version checking and initialization
+#### Core Operations Completion
 
-### 3. Implement Core Operations
+- Implement proper sequencing logic in the `sequenceEntries` method
+- Complete entry integration logic in the `integrateNewEntries` method
+- Complete checkpoint publishing in the `publishCheckpoint` method
+- Complete migration writer functionality (`AddEntry` and `AddEntryHashes`)
 
-- Implement tile reading/writing operations
-- Implement entry bundle reading/writing
-- Implement checkpoint reading/writing
-- Implement streaming entries functionality
-- Integrate with Merkle tree operations
+#### Concurrency and Transactions
 
-### 4. Concurrency and Transactions
+- Implement proper Firestore transactions for atomic operations
+- Optimize batch operations for performance
+- Complete thread-safety implementation for all operations
 
-- Implement concurrency control using Firestore transactions
-- Handle optimistic concurrency for checkpoint updates
-- Ensure thread-safety for all operations
+#### Testing
 
-### 5. Testing
+- Create comprehensive unit tests for all operations
+- Set up Firestore emulator for integration tests
+- Create performance benchmarks
+- Test compatibility with existing Trillian Tessera operations
 
-- Create unit tests for all Firestore operations
-- Implement integration tests against Firestore emulator
-- Create benchmarks to measure performance
-- Verify compatibility with existing Trillian Tessera operations
+#### Documentation
 
-### 6. Documentation
-
-- Document Firestore schema design
-- Create performance comparison with other backends
-- Document configuration options and best practices
+- Update documentation with implementation details
+- Document performance characteristics
 - Add usage examples
-
-### 7. Tooling and Integration
-
-- Add Firestore backend to appropriate CLI tools
-- Create migration utilities for existing backends to Firestore
-- Implement conformance test for Firestore
 
 ## Design Considerations
 
 ### Firestore Document Structure
 
+The current implementation uses the following document structure:
+
 ```
-collections/
-├── log_name/
+logs/
+├── {log_id}/
 │   ├── tiles/
-│   │   └── {path}/
-│   │       └── {tile_data}
+│   │   └── {tile_path}
 │   ├── entries/
-│   │   └── {path}/
-│   │       └── {entry_data}
-│   └── checkpoints/
-│       └── {checkpoint_data}
+│   │   └── {entry_bundle_path}
+│   ├── checkpoints/
+│   │   └── latest
+│   └── metadata/
+│       ├── version
+│       └── sequence
 ```
 
-### Performance Optimizations
+Where:
+- Document paths follow the Trillian Tessera layout conventions
+- Each document contains its data and metadata (creation time, etc.)
+- Metadata documents track schema version and sequence information
+
+### Current Implementation Details
+
+- Document creation and retrieval uses the Firestore Document API
+- Background goroutines handle integration and checkpoint publication
+- The storage queue is used for batching entries
+- Locking is used to ensure thread safety
+
+### Performance Optimizations Planned
 
 - Use Firestore batching for multi-document operations
 - Implement caching for frequently accessed tiles
@@ -84,21 +95,14 @@ collections/
 - Implement proper error handling for permission issues
 - Consider encryption options for sensitive data
 
-## Implementation Order
+## Next Steps
 
-1. Basic infrastructure and client setup
-2. Core document operations (read/write)
-3. Integration with tree operations
-4. Concurrency and transactions
-5. Testing and validation
-6. Documentation and examples
-
-## Estimated Timeline
-
-- Infrastructure and basic operations: 2-3 days
-- Core implementation: 1 week
-- Testing and validation: 3-4 days
-- Documentation and examples: 1-2 days
+1. Complete the sequencing logic for adding entries
+2. Implement integration of new entries into the Merkle tree
+3. Implement checkpoint publication
+4. Complete migration writer functionality
+5. Expand test coverage
+6. Finalize documentation
 
 ## References
 
