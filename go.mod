@@ -5,6 +5,7 @@ go 1.24.0
 toolchain go1.24.1
 
 require (
+	cloud.google.com/go/firestore v1.19.0
 	cloud.google.com/go/spanner v1.77.0
 	cloud.google.com/go/storage v1.51.0
 	github.com/RobinUS2/golang-moving-average v1.0.0
