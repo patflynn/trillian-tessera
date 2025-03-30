@@ -16,28 +16,22 @@
 package firestore
 
 import (
-	"bytes"
 	"context"
-	"encoding/base64"
 	"errors"
 	"fmt"
-	"math/rand"
-	"strings"
+	"os"
 	"sync"
 	"time"
 
 	"cloud.google.com/go/firestore"
-	"github.com/transparency-dev/merkle/compact"
-	"github.com/transparency-dev/merkle/rfc6962"
-	"golang.org/x/sync/errgroup"
-	"google.golang.org/api/iterator"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/transparency-dev/formats/log"
 	"github.com/transparency-dev/trillian-tessera"
 	"github.com/transparency-dev/trillian-tessera/api/layout"
-	"github.com/transparency-dev/trillian-tessera/internal/witness"
-	storagehelpers "github.com/transparency-dev/trillian-tessera/storage/internal"
+	"github.com/transparency-dev/trillian-tessera/internal/parse"
+	storage "github.com/transparency-dev/trillian-tessera/storage/internal"
 )
 
 // This is the required storage schema version.
@@ -68,6 +62,12 @@ const (
 	defaultMaxRetryDelay       = 5 * time.Second
 )
 
+// TileID represents a unique tile identifier within a log.
+type TileID struct {
+	Level uint64
+	Index uint64
+}
+
 // Config holds the configuration for a firestore storage implementation.
 type Config struct {
 	// Project is the GCP project ID for Firestore.
@@ -91,7 +91,6 @@ type Storage struct {
 type logReader struct {
 	client   *firestore.Client
 	logPath  string
-	hasher   compact.HashFn
 	tileSize uint64
 }
 
@@ -118,7 +117,7 @@ type appender struct {
 	reader    *logReader
 	coords    *firestoreCoordinator
 	store     *logResourceStore
-	integrate *storagehelpers.Integrate
+	queue     *storage.Queue
 	
 	cpFreq    time.Duration
 	intFreq   time.Duration
@@ -127,9 +126,12 @@ type appender struct {
 	// For background goroutines
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
+	
+	// Channel that gets signaled when the checkpoint has been updated
+	cpUpdated chan struct{}
 }
 
-// migrationStorage implements tessera.MigrationLogWriter for a Firestore-backed log.
+// migrationStorage implements a migration writer for a Firestore-backed log.
 type migrationStorage struct {
 	client   *firestore.Client
 	logPath  string
@@ -156,24 +158,25 @@ func New(ctx context.Context, c Config) (tessera.Driver, error) {
 }
 
 // Appender returns a tessera.Appender instance for the specified log.
-func (s *Storage) Appender(ctx context.Context, opts tessera.AppenderOptions) (tessera.Appender, error) {
+func (s *Storage) Appender(ctx context.Context, opts *tessera.AppendOptions) (*tessera.Appender, tessera.LogReader, error) {
 	client, err := firestore.NewClient(ctx, s.config.Project)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create Firestore client: %v", err)
+		return nil, nil, fmt.Errorf("failed to create Firestore client: %v", err)
 	}
 	
-	logPath := fmt.Sprintf("%s/%s", s.config.CollectionPrefix, opts.LogID)
+	logID := "default" // This is a placeholder - we'd need to get a real log ID from somewhere
+	logPath := fmt.Sprintf("%s/%s", s.config.CollectionPrefix, logID)
 	
 	// Initialize the log if needed
 	if err := ensureVersion(ctx, client, logPath); err != nil {
-		return nil, fmt.Errorf("failed to ensure version: %v", err)
+		client.Close()
+		return nil, nil, fmt.Errorf("failed to ensure version: %v", err)
 	}
 	
 	reader := &logReader{
 		client:   client,
 		logPath:  logPath,
-		hasher:   rfc6962.DefaultHasher.HashLeaf,
-		tileSize: layout.TileSize,
+		tileSize: layout.TileWidth,
 	}
 	
 	store := &logResourceStore{
@@ -187,16 +190,6 @@ func (s *Storage) Appender(ctx context.Context, opts tessera.AppenderOptions) (t
 		batchSize: s.config.MaxBatchSize,
 	}
 	
-	// Create the integration helper
-	integrate := &storagehelpers.Integrate{
-		Hasher:   rfc6962.DefaultHasher,
-		TileSize: layout.TileSize,
-		Reader:   reader,
-		SetTile: func(ctx context.Context, path string, data []byte) error {
-			return store.setTile(ctx, path, data)
-		},
-	}
-	
 	// Create a cancelable context for the background goroutines
 	appCtx, cancel := context.WithCancel(ctx)
 	
@@ -207,11 +200,18 @@ func (s *Storage) Appender(ctx context.Context, opts tessera.AppenderOptions) (t
 		reader:    reader,
 		coords:    coords,
 		store:     store,
-		integrate: integrate,
 		cpFreq:    s.config.CheckpointFrequency,
 		intFreq:   s.config.IntegrateFrequency,
 		maxBatch:  s.config.MaxBatchSize,
 		cancel:    cancel,
+		cpUpdated: make(chan struct{}),
+	}
+	
+	a.queue = storage.NewQueue(ctx, opts.BatchMaxAge(), opts.BatchMaxSize(), a.addEntries)
+	
+	// Create the actual tessera.Appender struct
+	appender := &tessera.Appender{
+		Add: a.add,
 	}
 	
 	// Start background tasks
@@ -219,20 +219,22 @@ func (s *Storage) Appender(ctx context.Context, opts tessera.AppenderOptions) (t
 	go a.integrateLoop()
 	go a.checkpointLoop()
 	
-	return a, nil
+	return appender, reader, nil
 }
 
-// MigrationWriter creates a new MigrationLogWriter for the specified log.
-func (s *Storage) MigrationWriter(ctx context.Context, opts tessera.MigrationOptions) (tessera.MigrationLogWriter, error) {
+// MigrationWriter creates a new migration writer for the specified log.
+func (s *Storage) MigrationWriter(ctx context.Context, opts *tessera.AppendOptions) (interface{}, error) {
 	client, err := firestore.NewClient(ctx, s.config.Project)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Firestore client: %v", err)
 	}
 	
-	logPath := fmt.Sprintf("%s/%s", s.config.CollectionPrefix, opts.LogID)
+	logID := "default" // This is a placeholder - we'd need to get a real log ID from somewhere
+	logPath := fmt.Sprintf("%s/%s", s.config.CollectionPrefix, logID)
 	
 	// Initialize the log if needed
 	if err := ensureVersion(ctx, client, logPath); err != nil {
+		client.Close()
 		return nil, fmt.Errorf("failed to ensure version: %v", err)
 	}
 	
@@ -257,11 +259,11 @@ func (s *Storage) MigrationWriter(ctx context.Context, opts tessera.MigrationOpt
 
 // ReadCheckpoint implements tessera.LogReader.
 func (r *logReader) ReadCheckpoint(ctx context.Context) ([]byte, error) {
-	docRef := r.client.Collection(r.logPath).Collection(checkpointCollectionName).Doc(latestCheckpointDocName)
+	docRef := r.client.Doc(fmt.Sprintf("%s/%s/%s", r.logPath, checkpointCollectionName, latestCheckpointDocName))
 	
 	doc, err := docRef.Get(ctx)
 	if status.Code(err) == codes.NotFound {
-		return nil, tessera.ErrNoDataFound
+		return nil, os.ErrNotExist
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to read checkpoint: %v", err)
@@ -281,12 +283,13 @@ func (r *logReader) ReadCheckpoint(ctx context.Context) ([]byte, error) {
 }
 
 // ReadTile implements tessera.LogReader.
-func (r *logReader) ReadTile(ctx context.Context, path string) ([]byte, error) {
-	docRef := r.client.Collection(r.logPath).Collection(tileCollectionName).Doc(path)
+func (r *logReader) ReadTile(ctx context.Context, l, i uint64, p uint8) ([]byte, error) {
+	path := layout.TilePath(l, i, p)
+	docRef := r.client.Doc(fmt.Sprintf("%s/%s/%s", r.logPath, tileCollectionName, path))
 	
 	doc, err := docRef.Get(ctx)
 	if status.Code(err) == codes.NotFound {
-		return nil, tessera.ErrNoDataFound
+		return nil, os.ErrNotExist
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to read tile: %v", err)
@@ -306,12 +309,13 @@ func (r *logReader) ReadTile(ctx context.Context, path string) ([]byte, error) {
 }
 
 // ReadEntryBundle implements tessera.LogReader.
-func (r *logReader) ReadEntryBundle(ctx context.Context, path string) ([]byte, error) {
-	docRef := r.client.Collection(r.logPath).Collection(entryCollectionName).Doc(path)
+func (r *logReader) ReadEntryBundle(ctx context.Context, i uint64, p uint8) ([]byte, error) {
+	path := layout.EntriesPath(i, p)
+	docRef := r.client.Doc(fmt.Sprintf("%s/%s/%s", r.logPath, entryCollectionName, path))
 	
 	doc, err := docRef.Get(ctx)
 	if status.Code(err) == codes.NotFound {
-		return nil, tessera.ErrNoDataFound
+		return nil, os.ErrNotExist
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to read entry bundle: %v", err)
@@ -333,46 +337,35 @@ func (r *logReader) ReadEntryBundle(ctx context.Context, path string) ([]byte, e
 // IntegratedSize implements tessera.LogReader.
 func (r *logReader) IntegratedSize(ctx context.Context) (uint64, error) {
 	checkpointBytes, err := r.ReadCheckpoint(ctx)
-	if err == tessera.ErrNoDataFound {
+	if err == os.ErrNotExist {
 		return 0, nil
 	}
 	if err != nil {
 		return 0, fmt.Errorf("failed to read checkpoint: %v", err)
 	}
 	
-	cp, err := witness.ParseCheckpoint(checkpointBytes)
+	_, size, _, err := parse.CheckpointUnsafe(checkpointBytes)
 	if err != nil {
 		return 0, fmt.Errorf("failed to parse checkpoint: %v", err)
 	}
 	
-	return cp.Size, nil
+	return size, nil
 }
 
 // StreamEntries implements tessera.LogReader.
-func (r *logReader) StreamEntries(ctx context.Context, start, count uint64, prefetch bool) (<-chan tessera.EntryChunk, error) {
-	if count == 0 {
-		return nil, nil
+func (r *logReader) StreamEntries(ctx context.Context, fromEntry uint64) (next func() (ri layout.RangeInfo, bundle []byte, err error), cancel func()) {
+	// Use StreamAdaptor from storage package
+	getBundle := func(ctx context.Context, i uint64, p uint8) ([]byte, error) {
+		return r.ReadEntryBundle(ctx, i, p)
 	}
 	
-	chunks := make(chan tessera.EntryChunk)
-	
-	go func() {
-		defer close(chunks)
-		
-		// TODO: Implement streaming logic for entries
-		// This is placeholder code
-		chunks <- tessera.EntryChunk{
-			Entries: nil,
-			Err:     errors.New("StreamEntries not yet implemented"),
-		}
-	}()
-	
-	return chunks, nil
+	return storage.StreamAdaptor(ctx, 10, r.IntegratedSize, getBundle, fromEntry)
 }
 
 // setTile writes a tile to the store.
-func (s *logResourceStore) setTile(ctx context.Context, path string, data []byte) error {
-	docRef := s.client.Collection(s.logPath).Collection(tileCollectionName).Doc(path)
+func (s *logResourceStore) setTile(ctx context.Context, l, i uint64, p uint8, data []byte) error {
+	path := layout.TilePath(l, i, p)
+	docRef := s.client.Doc(fmt.Sprintf("%s/%s/%s", s.logPath, tileCollectionName, path))
 	
 	_, err := docRef.Set(ctx, map[string]interface{}{
 		"data": data,
@@ -386,8 +379,9 @@ func (s *logResourceStore) setTile(ctx context.Context, path string, data []byte
 }
 
 // setEntryBundle writes an entry bundle to the store.
-func (s *logResourceStore) setEntryBundle(ctx context.Context, path string, data []byte) error {
-	docRef := s.client.Collection(s.logPath).Collection(entryCollectionName).Doc(path)
+func (s *logResourceStore) setEntryBundle(ctx context.Context, i uint64, p uint8, data []byte) error {
+	path := layout.EntriesPath(i, p)
+	docRef := s.client.Doc(fmt.Sprintf("%s/%s/%s", s.logPath, entryCollectionName, path))
 	
 	_, err := docRef.Set(ctx, map[string]interface{}{
 		"data": data,
@@ -402,7 +396,7 @@ func (s *logResourceStore) setEntryBundle(ctx context.Context, path string, data
 
 // setCheckpoint writes a checkpoint to the store.
 func (s *logResourceStore) setCheckpoint(ctx context.Context, data []byte) error {
-	docRef := s.client.Collection(s.logPath).Collection(checkpointCollectionName).Doc(latestCheckpointDocName)
+	docRef := s.client.Doc(fmt.Sprintf("%s/%s/%s", s.logPath, checkpointCollectionName, latestCheckpointDocName))
 	
 	_, err := docRef.Set(ctx, map[string]interface{}{
 		"data": data,
@@ -415,9 +409,19 @@ func (s *logResourceStore) setCheckpoint(ctx context.Context, data []byte) error
 	return nil
 }
 
-// Add implements tessera.Appender.
-func (a *appender) Add(ctx context.Context, entries [][]byte) ([]uint64, error) {
-	return a.coords.sequenceEntries(ctx, entries)
+// add is the implementation of tessera.AddFn
+func (a *appender) add(ctx context.Context, entry *tessera.Entry) tessera.IndexFuture {
+	return a.queue.Add(ctx, entry)
+}
+
+// addEntries is called by the queue when there's a batch of entries ready for sequencing
+func (a *appender) addEntries(ctx context.Context, entries []*tessera.Entry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	
+	// TODO: Implement entry sequencing and integration
+	return nil
 }
 
 // integrateLoop continuously checks for new entries to integrate into the tree.
@@ -462,47 +466,40 @@ func (a *appender) checkpointLoop() {
 
 // integrateNewEntries processes any new entries that haven't been integrated yet.
 func (a *appender) integrateNewEntries(ctx context.Context) error {
-	// TODO: Implement integration logic
+	// TODO: Implement integration logic for new entries
 	return nil
 }
 
 // publishCheckpoint creates and stores a new checkpoint.
 func (a *appender) publishCheckpoint(ctx context.Context) error {
 	// TODO: Implement checkpoint publication
+	select {
+	case a.cpUpdated <- struct{}{}:
+	default:
+	}
 	return nil
 }
 
-// Close implements tessera.Appender.
-func (a *appender) Close() error {
-	a.cancel()
-	a.wg.Wait()
-	return a.client.Close()
-}
-
-// sequenceEntries assigns sequence numbers to the provided entries and stores them.
-func (c *firestoreCoordinator) sequenceEntries(ctx context.Context, entries [][]byte) ([]uint64, error) {
-	if len(entries) == 0 {
-		return nil, nil
-	}
-	
-	// TODO: Implement sequencing logic using Firestore transactions
-	return nil, errors.New("sequenceEntries not yet implemented")
-}
-
-// AddEntry implements tessera.MigrationLogWriter.
+// AddEntry implements migration writer.
 func (m *migrationStorage) AddEntry(ctx context.Context, idx uint64, entry []byte) error {
 	// TODO: Implement migration writer AddEntry
 	return errors.New("AddEntry not yet implemented")
 }
 
-// Close implements tessera.MigrationLogWriter.
+// AddEntryHashes implements migration writer.
+func (m *migrationStorage) AddEntryHashes(ctx context.Context, start uint64, leafHashes [][]byte) error {
+	// TODO: Implement migration writer AddEntryHashes
+	return errors.New("AddEntryHashes not yet implemented")
+}
+
+// Close implements closer.
 func (m *migrationStorage) Close() error {
 	return m.client.Close()
 }
 
 // ensureVersion checks and initializes the log version.
 func ensureVersion(ctx context.Context, client *firestore.Client, logPath string) error {
-	versionRef := client.Collection(logPath).Collection(metadataCollectionName).Doc(versionDocName)
+	versionRef := client.Doc(fmt.Sprintf("%s/%s/%s", logPath, metadataCollectionName, versionDocName))
 	
 	// Check if version doc exists
 	doc, err := versionRef.Get(ctx)
@@ -537,29 +534,26 @@ func initializeLog(ctx context.Context, client *firestore.Client, logPath string
 	batch := client.Batch()
 	
 	// Create version document
-	versionRef := client.Collection(logPath).Collection(metadataCollectionName).Doc(versionDocName)
+	versionRef := client.Doc(fmt.Sprintf("%s/%s/%s", logPath, metadataCollectionName, versionDocName))
 	batch.Set(versionRef, map[string]interface{}{
 		"version": requiredVersion,
 		"created": time.Now(),
 	})
 	
 	// Create sequence document
-	seqRef := client.Collection(logPath).Collection(metadataCollectionName).Doc(sequenceDocName)
+	seqRef := client.Doc(fmt.Sprintf("%s/%s/%s", logPath, metadataCollectionName, sequenceDocName))
 	batch.Set(seqRef, map[string]interface{}{
 		"next": 0,
 		"updated": time.Now(),
 	})
 	
 	// Create empty checkpoint document
-	cpRef := client.Collection(logPath).Collection(checkpointCollectionName).Doc(latestCheckpointDocName)
-	emptyCheckpoint := witness.Checkpoint{
+	cpRef := client.Doc(fmt.Sprintf("%s/%s/%s", logPath, checkpointCollectionName, latestCheckpointDocName))
+	emptyCheckpoint := log.Checkpoint{
 		Origin: "Firestore",
 		Size:   0,
 	}
-	cpBytes, err := emptyCheckpoint.Marshal()
-	if err != nil {
-		return fmt.Errorf("failed to marshal empty checkpoint: %v", err)
-	}
+	cpBytes := emptyCheckpoint.Marshal()
 	
 	batch.Set(cpRef, map[string]interface{}{
 		"data": cpBytes,
@@ -567,7 +561,7 @@ func initializeLog(ctx context.Context, client *firestore.Client, logPath string
 	})
 	
 	// Commit the batch
-	_, err = batch.Commit(ctx)
+	_, err := batch.Commit(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to initialize log: %v", err)
 	}

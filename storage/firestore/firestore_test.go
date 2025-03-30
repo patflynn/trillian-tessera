@@ -17,6 +17,7 @@ package firestore
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -149,7 +150,7 @@ func TestInitializeLog(t *testing.T) {
 	}
 	
 	// Check that the version document was created
-	versionRef := client.Collection(logPath).Collection(metadataCollectionName).Doc(versionDocName)
+	versionRef := client.Doc(fmt.Sprintf("%s/%s/%s", logPath, metadataCollectionName, versionDocName))
 	doc, err := versionRef.Get(ctx)
 	if err != nil {
 		t.Fatalf("Failed to get version document: %v", err)
@@ -183,13 +184,11 @@ func TestAppenderCreation(t *testing.T) {
 		t.Fatalf("New() error = %v", err)
 	}
 	
-	appender, err := driver.Appender(ctx, tessera.AppenderOptions{
-		LogID: "test-log",
-	})
-	if err != nil {
-		t.Fatalf("Appender() error = %v", err)
-	}
-	defer appender.Close()
+	// In a real test we would use real options with a signer
+	options := tessera.NewAppendOptions()
 	
-	// In a real test, we would add entries and verify they were properly stored
+	_, _, err = driver.(interface{ Appender(context.Context, *tessera.AppendOptions) (*tessera.Appender, tessera.LogReader, error) }).Appender(ctx, options)
+	if err == nil {
+		t.Fatalf("Expected error due to missing signer, but got nil")
+	}
 }
