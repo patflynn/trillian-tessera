@@ -15,12 +15,6 @@ terraform {
   required_version = ">= 1.9.8, < 2.0.0"
 }
 
-locals {
-  # Cloud SQL IAM database usernames are the SA email WITHOUT the
-  # ".gserviceaccount.com" suffix.
-  sql_iam_user = trimsuffix(var.ci_sa_email, ".gserviceaccount.com")
-}
-
 ##
 ## Ephemeral Cloud SQL (MySQL) instance (runbook §4).
 ##
@@ -52,9 +46,15 @@ resource "google_sql_database_instance" "tessera_ci_mysql" {
 }
 
 # IAM database user for the CI service account (passwordless / keyless).
+#
+# For type=CLOUD_IAM_SERVICE_ACCOUNT the Cloud SQL Admin API requires the FULL
+# service-account email here (e.g. tessera-ci@PROJECT.iam.gserviceaccount.com) —
+# NOT the truncated ".iam" form. (The truncated form is only the MySQL *login*
+# name, surfaced as the GCP_SQL_IAM_USER repo variable for the auth proxy.)
+# Passing the truncated form fails with "is not in valid format".
 resource "google_sql_user" "ci_iam_user" {
   project  = var.project_id
   instance = google_sql_database_instance.tessera_ci_mysql.name
-  name     = local.sql_iam_user
+  name     = var.ci_sa_email
   type     = "CLOUD_IAM_SERVICE_ACCOUNT"
 }
