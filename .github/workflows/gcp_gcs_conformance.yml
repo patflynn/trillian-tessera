@@ -100,6 +100,41 @@ jobs:
             sleep 1
           done
 
+      - name: Grant the per-run database to the IAM user
+        env:
+          SA_EMAIL: ${{ vars.GCP_CI_SA_EMAIL }}
+        run: |
+          # A freshly-created Cloud SQL IAM database user can authenticate but has
+          # no privileges on any database, so the conformance server (which creates
+          # the coordination tables) would fail with "Access denied ... to database".
+          # Grant it full privileges on just the per-run database.
+          #
+          # The grant must run as a privileged user, but the --auto-iam-authn proxy
+          # forces IAM auth on every connection, and the IAM user cannot grant to
+          # itself. So set an ephemeral root password (keyless, via the SA's
+          # cloudsql.admin role) and run the GRANT through a second, plain proxy.
+          MYSQL_USER="${SA_EMAIL%%@*}"
+          ROOT_PW="$(openssl rand -hex 24)"
+          gcloud sql users set-password root --host=% \
+            --instance=tessera-ci-mysql --password="${ROOT_PW}"
+
+          ./cloud-sql-proxy --port 3307 "${{ vars.GCP_SQL_CONNECTION }}" \
+            >"${{ runner.temp }}/cloud-sql-proxy-admin.log" 2>&1 &
+          ADMIN_PROXY_PID=$!
+          for i in $(seq 1 30); do
+            (echo > /dev/tcp/127.0.0.1/3307) >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+          if ! command -v mysql >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq mysql-client
+          fi
+          MYSQL_PWD="${ROOT_PW}" mysql --protocol=TCP -h 127.0.0.1 -P 3307 -u root \
+            -e "GRANT ALL PRIVILEGES ON \`${DB}\`.* TO '${MYSQL_USER}'@'%'; FLUSH PRIVILEGES;"
+          echo "Granted ALL on ${DB} to '${MYSQL_USER}'@'%'."
+
+          kill "${ADMIN_PROXY_PID}" 2>/dev/null || true
+
       - name: Generate ephemeral log keys
         run: |
           go run github.com/transparency-dev/serverless-log/cmd/generate_keys@80334bc9dc573e8f6c5b3694efad6358da50abd4 \
@@ -185,6 +220,8 @@ jobs:
           cat "${{ runner.temp }}/conformance.log" || true
           echo "===== cloud-sql-proxy log ====="
           cat "${{ runner.temp }}/cloud-sql-proxy.log" || true
+          echo "===== cloud-sql-proxy (admin) log ====="
+          cat "${{ runner.temp }}/cloud-sql-proxy-admin.log" || true
 
       - name: Teardown per-run resources
         if: always()
