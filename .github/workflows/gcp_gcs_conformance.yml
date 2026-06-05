@@ -112,14 +112,19 @@ jobs:
           #
           # The grant must run as a privileged user, but the --auto-iam-authn proxy
           # forces IAM auth on every connection and the IAM user cannot grant to
-          # itself. So set an ephemeral root password (keyless, via the SA's
-          # cloudsql.admin role) and, through a second plain proxy, have root CREATE
-          # the database (so root owns it and can grant on it) and GRANT it to the
-          # IAM user.
+          # itself. The instance's root@% user is unprivileged here, but a built-in
+          # user created via the Admin API is automatically granted the
+          # cloudsqlsuperuser role (and Cloud SQL activates roles on login). So
+          # create an ephemeral admin user (keyless, via the SA's cloudsql.admin
+          # role) and, through a second plain proxy, have it CREATE the database and
+          # GRANT it to the IAM user.
           MYSQL_USER="${SA_EMAIL%%@*}"
-          ROOT_PW="$(openssl rand -hex 24)"
-          gcloud sql users set-password root --host=% \
-            --instance=tessera-ci-mysql --password="${ROOT_PW}"
+          ADMIN_USER="ci-admin"
+          ADMIN_PW="$(openssl rand -hex 24)"
+          gcloud sql users create "${ADMIN_USER}" --host=% \
+            --instance=tessera-ci-mysql --password="${ADMIN_PW}" 2>/dev/null \
+            || gcloud sql users set-password "${ADMIN_USER}" --host=% \
+                 --instance=tessera-ci-mysql --password="${ADMIN_PW}"
 
           ./cloud-sql-proxy --port 3307 "${{ vars.GCP_SQL_CONNECTION }}" \
             >"${{ runner.temp }}/cloud-sql-proxy-admin.log" 2>&1 &
@@ -133,7 +138,7 @@ jobs:
             sudo apt-get update -qq && sudo apt-get install -y -qq mysql-client
           fi
           # SHOW GRANTS is printed for diagnostics if anything below fails.
-          MYSQL_PWD="${ROOT_PW}" mysql --protocol=TCP -h 127.0.0.1 -P 3307 -u root -e "
+          MYSQL_PWD="${ADMIN_PW}" mysql --protocol=TCP -h 127.0.0.1 -P 3307 -u "${ADMIN_USER}" -e "
             SELECT CURRENT_USER();
             SHOW GRANTS FOR CURRENT_USER();
             CREATE DATABASE IF NOT EXISTS \`${DB}\`;
