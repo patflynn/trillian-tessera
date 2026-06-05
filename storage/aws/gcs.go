@@ -98,7 +98,7 @@ func (s *gcsStore) getObject(ctx context.Context, obj string) ([]byte, error) {
 		}
 		return nil, fmt.Errorf("getObject: failed to create reader for object %q in bucket %q: %w", objName, s.bucket, err)
 	}
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 
 	d, err := io.ReadAll(r)
 	if err != nil {
@@ -111,13 +111,19 @@ func (s *gcsStore) getObject(ctx context.Context, obj string) ([]byte, error) {
 func (s *gcsStore) setObject(ctx context.Context, objName string, data []byte, contType string, cacheControl string) error {
 	name := s.objectName(objName)
 
+	// Use a cancellable context so a failed write can abort the upload and
+	// release the writer's resources (cancelling the context is the documented
+	// replacement for the deprecated Writer.CloseWithError).
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	w := s.gcsClient.Bucket(s.bucket).Object(name).NewWriter(ctx)
 	w.ContentType = contType
 	w.CacheControl = cacheControl
 
 	if _, err := w.Write(data); err != nil {
 		// Abort the upload so the writer's resources are released.
-		_ = w.CloseWithError(err)
+		cancel()
 		return fmt.Errorf("failed to write object %q to bucket %q: %w", name, s.bucket, err)
 	}
 	if err := w.Close(); err != nil {
@@ -136,17 +142,25 @@ func (s *gcsStore) setObject(ctx context.Context, objName string, data []byte, c
 func (s *gcsStore) setObjectIfNoneMatch(ctx context.Context, objName string, data []byte, contType string, cacheControl string) error {
 	name := s.objectName(objName)
 
-	w := s.gcsClient.Bucket(s.bucket).Object(name).If(gcs.Conditions{DoesNotExist: true}).NewWriter(ctx)
+	// Use a separate cancellable context for the writer so a failed write can
+	// abort the upload and release the writer's resources (cancelling the
+	// context is the documented replacement for the deprecated
+	// Writer.CloseWithError). The original ctx is kept intact for the
+	// follow-up getObject read in the precondition-failed path below.
+	writeCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	w := s.gcsClient.Bucket(s.bucket).Object(name).If(gcs.Conditions{DoesNotExist: true}).NewWriter(writeCtx)
 	w.ContentType = contType
 	w.CacheControl = cacheControl
 
 	// The precondition failure may surface on either Write or Close, so collect
 	// the first error from the write/close sequence. On a write error abort the
-	// writer with CloseWithError so its resources are released; otherwise the
-	// (possibly precondition) error surfaces from Close.
+	// writer by cancelling its context so its resources are released; otherwise
+	// the (possibly precondition) error surfaces from Close.
 	writeErr := func() error {
 		if _, err := w.Write(data); err != nil {
-			_ = w.CloseWithError(err)
+			cancel()
 			return err
 		}
 		return w.Close()
