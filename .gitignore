@@ -31,3 +31,6 @@ go.work.sum
 
 # lockfiles
 /testdata/log/checkpoint.lock
+
+# direnv (nix flake devShell cache)
+/.direnv/
