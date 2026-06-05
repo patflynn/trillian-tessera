@@ -3,7 +3,9 @@ terraform {
 
   required_providers {
     google = {
-      source  = "registry.terraform.io/hashicorp/google"
+      # Bare source so OpenTofu resolves the provider consistently between
+      # `init` and `apply` under Terragrunt's provider cache (see ci_identity).
+      source  = "hashicorp/google"
       version = "6.1.0"
     }
   }

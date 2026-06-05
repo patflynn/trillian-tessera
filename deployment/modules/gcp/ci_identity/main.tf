@@ -3,7 +3,12 @@ terraform {
 
   required_providers {
     google = {
-      source  = "registry.terraform.io/hashicorp/google"
+      # Bare source (not the conformance module's explicit
+      # registry.terraform.io/...) so OpenTofu resolves it via its own registry
+      # consistently between `init` and `apply`. The explicit terraform.io form
+      # makes Terragrunt's provider cache install terraform.io while apply looks
+      # for opentofu.org, breaking `tofu apply` in the workflows.
+      source  = "hashicorp/google"
       version = "6.1.0"
     }
   }
