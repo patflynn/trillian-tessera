@@ -15,6 +15,16 @@ See [`docs/design/gcp-ci-setup.md`](../../../../docs/design/gcp-ci-setup.md) for
 the design and [`deployment/README.md`](../../../README.md) for the full
 bootstrap order.
 
+> **Status on `tessera-498520` (the current fork project): already provisioned
+> imperatively.** These resources (WIF pool `github-pool` + provider
+> `github-provider`, the `tessera-ci` service account, its IAM bindings, and the
+> enabled APIs) were created directly with `gcloud` and verified, and the four
+> `GCP_*` repo variables are set. So on this project the stack is **not** applied
+> — running `terragrunt apply` here would fail with "already exists". Treat this
+> config as the **from-scratch / disaster-recovery blueprint**: it's what you'd
+> apply on a brand-new project. To make Terraform manage the existing resources
+> instead, `tofu import` each one into this stack's state first.
+
 ## Environment variables it reads
 
 | Variable          | Required | Default       | Purpose                                  |
