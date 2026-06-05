@@ -1,0 +1,48 @@
+name: CI Infra Apply (ephemeral Cloud SQL)
+
+# Recreates the ephemeral ci-mysql stack on demand. Manual trigger ONLY (no
+# schedule) so the DB never comes back unexpectedly and racks up spend. The
+# persistent ci-identity stack must already be applied (see deployment/README.md).
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # required for WIF/OIDC
+
+concurrency:
+  # Serialize with teardown so the two never race on the same Cloud SQL instance.
+  group: ci-infra-mysql
+  cancel-in-progress: false
+
+env:
+  tofu_version: '1.10.0'
+  tg_version: '0.77.22'
+  GOOGLE_PROJECT: ${{ vars.GCP_PROJECT_ID }}
+  GOOGLE_REGION: ${{ vars.GCP_REGION }}
+  TESSERA_CI_SA_EMAIL: ${{ vars.GCP_CI_SA_EMAIL }}
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Authenticate to GCP (keyless, WIF)
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.7
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_CI_SA_EMAIL }}
+
+      - name: Terragrunt apply ci-mysql
+        uses: gruntwork-io/terragrunt-action@4ed5b7344c80315e5357f28f36159fc980bc2d5a # v3.4.0
+        with:
+          tofu_version: ${{ env.tofu_version }}
+          tg_version: ${{ env.tg_version }}
+          tg_dir: 'deployment/live/gcp/ci-mysql'
+          tg_command: 'apply --terragrunt-non-interactive'

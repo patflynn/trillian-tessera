@@ -1,0 +1,52 @@
+name: CI Infra Teardown (ephemeral Cloud SQL)
+
+# Destroys ONLY the ephemeral ci-mysql stack to stop overnight spend. The
+# persistent ci-identity stack (WIF pool/provider + CI service account) is never
+# touched here. Recreate the DB with the ci_infra_apply workflow or a local
+# `terragrunt apply`.
+
+on:
+  schedule:
+    # 09:00 UTC nightly (~01:00-02:00 US Pacific). Cron is always UTC; edit freely.
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # required for WIF/OIDC
+
+concurrency:
+  # Serialize with apply so the two never race on the same Cloud SQL instance.
+  group: ci-infra-mysql
+  cancel-in-progress: false
+
+env:
+  tofu_version: '1.10.0'
+  tg_version: '0.77.22'
+  GOOGLE_PROJECT: ${{ vars.GCP_PROJECT_ID }}
+  GOOGLE_REGION: ${{ vars.GCP_REGION }}
+  TESSERA_CI_SA_EMAIL: ${{ vars.GCP_CI_SA_EMAIL }}
+
+jobs:
+  teardown:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Authenticate to GCP (keyless, WIF)
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.7
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_CI_SA_EMAIL }}
+
+      - name: Terragrunt destroy ci-mysql
+        uses: gruntwork-io/terragrunt-action@4ed5b7344c80315e5357f28f36159fc980bc2d5a # v3.4.0
+        with:
+          tofu_version: ${{ env.tofu_version }}
+          tg_version: ${{ env.tg_version }}
+          tg_dir: 'deployment/live/gcp/ci-mysql'
+          tg_command: 'destroy --terragrunt-non-interactive'
