@@ -37,6 +37,12 @@ jobs:
           output-file-path: output.txt
           github-token: ${{ secrets.GITHUB_TOKEN }}
           auto-push: false
+          # This fork has no gh-pages branch. Storing results to an external
+          # JSON file keeps the action off the gh-pages branch entirely, and
+          # skip-fetch-gh-pages avoids the otherwise-fatal fetch of the
+          # non-existent ref. The PR job only comments; it never pushes history.
+          external-data-json-path: ./benchmark-data.json
+          skip-fetch-gh-pages: true
           alert-threshold: "150%"
           fail-on-alert: false # Don't make red crosses on the PR, it's almost certainly a false positive currently
           comment-on-alert: true # notify on PR if alert triggers

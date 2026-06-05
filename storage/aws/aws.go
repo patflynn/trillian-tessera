@@ -65,6 +65,7 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/api/option"
 
 	"github.com/go-sql-driver/mysql"
 )
@@ -140,8 +141,33 @@ type sequencer interface {
 // Returns the updated root hash of the tree with the consumed entries integrated.
 type consumeFunc func(ctx context.Context, from uint64, entries []storage.SequencedEntry) ([]byte, error)
 
+// ObjectStore selects which object storage backend implementation is used to
+// store entry bundles, tiles and checkpoints.
+//
+// Write coordination is always handled by MySQL regardless of this value; only
+// the object store implementation changes.
+type ObjectStore int
+
+const (
+	// ObjectStoreS3 uses an S3-compatible object store via the AWS SDK. This is
+	// the default and the only configuration supported upstream.
+	ObjectStoreS3 ObjectStore = iota
+	// ObjectStoreGCS uses Google Cloud Storage via the native GCS client
+	// (cloud.google.com/go/storage), authenticating with Application Default
+	// Credentials / Workload Identity. See gcs.go.
+	ObjectStoreGCS
+)
+
 // Config holds AWS project and resource configuration for a storage instance.
 type Config struct {
+	// ObjectStore selects the object storage backend. It defaults to
+	// ObjectStoreS3, which leaves the AWS/S3 code path unchanged.
+	ObjectStore ObjectStore
+	// GCSOptions holds optional client options passed to the native GCS client
+	// when ObjectStore is ObjectStoreGCS. This is primarily useful in tests, to
+	// point the client at a fake GCS server. If unset, the client uses
+	// Application Default Credentials / Workload Identity.
+	GCSOptions []option.ClientOption
 	// SDKConfig is an optional AWS config to use when configuring service clients, e.g. to
 	// use non-AWS S3 or MySQL services.
 	//
@@ -174,18 +200,22 @@ type Config struct {
 // Storage instances created via this c'tor will participate in integrating newly sequenced entries into the log
 // and periodically publishing a new checkpoint which commits to the state of the tree.
 func New(ctx context.Context, cfg Config) (tessera.Driver, error) {
-	if cfg.SDKConfig == nil {
-		// We're running on AWS so use the SDK's default config which will will handle credentials etc.
-		sdkConfig, err := config.LoadDefaultConfig(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("failed to load default AWS configuration: %v", err)
+	// The AWS SDK config is only needed for the S3 object store. The GCS object
+	// store uses the native GCS client and its own credential resolution.
+	if cfg.ObjectStore == ObjectStoreS3 {
+		if cfg.SDKConfig == nil {
+			// We're running on AWS so use the SDK's default config which will will handle credentials etc.
+			sdkConfig, err := config.LoadDefaultConfig(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("failed to load default AWS configuration: %v", err)
+			}
+			cfg.SDKConfig = &sdkConfig
+			// We need a non-nil options func to pass in to s3.NewFromConfig below or it'll panic, so
+			// we'll use a "do nothing" placeholder.
+			cfg.S3Options = func(_ *s3.Options) {}
+		} else {
+			printDragonsWarning()
 		}
-		cfg.SDKConfig = &sdkConfig
-		// We need a non-nil options func to pass in to s3.NewFromConfig below or it'll panic, so
-		// we'll use a "do nothing" placeholder.
-		cfg.S3Options = func(_ *s3.Options) {}
-	} else {
-		printDragonsWarning()
 	}
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = http.DefaultClient
@@ -196,6 +226,24 @@ func New(ctx context.Context, cfg Config) (tessera.Driver, error) {
 	}, nil
 }
 
+// newObjStore constructs the object store implementation selected by the Config.
+//
+// By default this builds the S3-backed s3Storage, leaving the AWS code path
+// unchanged. When Config.ObjectStore is ObjectStoreGCS, it builds a native
+// GCS-backed gcsStore instead.
+func (s *Storage) newObjStore(ctx context.Context) (objStore, error) {
+	switch s.cfg.ObjectStore {
+	case ObjectStoreGCS:
+		return newGCSStore(ctx, s.cfg.Bucket, s.cfg.BucketPrefix, s.cfg.GCSOptions...)
+	default:
+		return &s3Storage{
+			s3Client:     s3.NewFromConfig(*s.cfg.SDKConfig, s.cfg.S3Options),
+			bucket:       s.cfg.Bucket,
+			bucketPrefix: s.cfg.BucketPrefix,
+		}, nil
+	}
+}
+
 // Appender creates a new tessera.Appender lifecycle object.
 func (s *Storage) Appender(ctx context.Context, opts *tessera.AppendOptions) (*tessera.Appender, tessera.LogReader, error) {
 	seq, err := newMySQLSequencer(ctx, s.cfg.DSN, uint64(opts.PushbackMaxOutstanding()), s.cfg.MaxOpenConns, s.cfg.MaxIdleConns)
@@ -203,13 +251,12 @@ func (s *Storage) Appender(ctx context.Context, opts *tessera.AppendOptions) (*t
 		return nil, nil, fmt.Errorf("failed to create MySQL sequencer: %v", err)
 	}
 
-	s3Store := &s3Storage{
-		s3Client:     s3.NewFromConfig(*s.cfg.SDKConfig, s.cfg.S3Options),
-		bucket:       s.cfg.Bucket,
-		bucketPrefix: s.cfg.BucketPrefix,
+	oStore, err := s.newObjStore(ctx)
+	if err != nil {
+		return nil, nil, err
 	}
 
-	a, lr, err := s.newAppender(ctx, s3Store, seq, opts)
+	a, lr, err := s.newAppender(ctx, oStore, seq, opts)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -542,12 +589,12 @@ func (a *Appender) updateEntryBundles(ctx context.Context, fromSeq uint64, entri
 
 // MigrationWriter creates a new AWS storage for the MigrationWriter lifecycle mode.
 func (s *Storage) MigrationWriter(ctx context.Context, opts *tessera.MigrationOptions) (migrate.MigrationWriter, tessera.LogReader, error) {
+	oStore, err := s.newObjStore(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
 	logStore := &logResourceStore{
-		objStore: &s3Storage{
-			s3Client:     s3.NewFromConfig(*s.cfg.SDKConfig, s.cfg.S3Options),
-			bucket:       s.cfg.Bucket,
-			bucketPrefix: s.cfg.BucketPrefix,
-		},
+		objStore:    oStore,
 		entriesPath: opts.EntriesPath(),
 	}
 	seq, err := newMySQLSequencer(ctx, s.cfg.DSN, DefaultPushbackMaxOutstanding, s.cfg.MaxOpenConns, s.cfg.MaxIdleConns)
