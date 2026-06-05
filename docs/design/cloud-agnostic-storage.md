@@ -1,344 +1,284 @@
-# Design: Run-anywhere object-storage backend (cloud + on-prem), proven on GCP CI
+# Design: Run-anywhere object-storage backend (cloud + on-prem)
 
-**Status:** Draft · **Owner:** patflynn · **Scope:** personal fork experiment (`patflynn/trillian-tessera`)
+**Status:** Draft (rev 2) · **Owner:** patflynn · **Scope:** personal fork experiment (`patflynn/trillian-tessera`)
 
-**Chosen direction (2026-06-05):** S3-interop + MySQL (this doc), with **keyless auth as a general,
-cross-provider feature** (not GCP-only). Firestore-native backend deferred; its plan is preserved
-on the `firestore-plan` branch of the fork. Next step is the Phase-0 spike (conditional-write +
-general keyless auth: GCS bearer [S3] and MinIO STS web-identity [S2]).
+**Chosen direction (2026-06-05):** Keep `storage/aws`'s MySQL coordination + integration logic;
+make the **object store a pluggable implementation behind the existing `objStore` interface**.
+Ship a **native-GCS-client** implementation first (GCS is required short-term), then evaluate a
+single `gocloud.dev/blob`-backed implementation for true run-anywhere. Firestore-native backend
+deferred (plan preserved on the `firestore-plan` branch).
+
+> **Rev 2 changes the core mechanism.** Rev 1 proposed pointing the AWS S3 client at GCS via
+> S3-interoperability and translating headers + auth. Investigation showed that path is the
+> *worst-of-both-worlds*: it's a configuration nobody runs in production **and** the one that needs
+> the most bespoke work (header translation, SigV4-stripping bearer auth, and it still hits GCS
+> gaps in batch-delete / chunked-PUT / HMAC org-policy). The native GCS client removes all of that.
+> S3-interop is retained **only** for genuinely S3-native stores (AWS, MinIO, Ceph/RGW, R2).
 
 ## Summary
 
-Tessera's `storage/aws` backend is, underneath the SDK, just **two portable protocols**:
-S3-compatible object storage for serving (entry bundles, tiles, checkpoints) and
-MySQL for write coordination. This proposal turns that latent portability into an
-explicit, tested backend that **runs anywhere** those two protocols exist — a managed
-cloud (GCS/Cloud SQL, S3/Aurora), an **on-prem Kubernetes cluster with MinIO + MySQL**,
-or any other S3-/MySQL-compatible combination (Ceph/RGW, Cloudflare R2, Vitess, …).
+Tessera's `storage/aws` backend has two separable halves:
 
-**Two principles drive the design:**
+1. **Object storage** — get/put/conditional-put/delete of bundles, tiles, checkpoints. Already
+   abstracted behind an unexported **`objStore` interface** (4 methods).
+2. **Write coordination** — sequencing/integration/publish/GC, on **MySQL** (`SeqCoord`, `Seq`,
+   `IntCoord`, `PubCoord`, `GCCoord`), using only standard SQL.
 
-1. **Run anywhere, no lock-in.** The same backend binary must run unchanged on a public cloud
-   *and* fully on-prem (k8s + MinIO + MySQL) with no dependency on any single vendor's services.
-2. **Auth is the operator's choice, not ours.** Where a platform offers keyless identity
-   (e.g. GCP **Workload Identity**), operators can use it and store **no secrets at all**. Where
-   they'd rather use **long-lived access keys** (HMAC) — on AWS, MinIO, on-prem, or simply by
-   preference — that is a **first-class, fully-supported path**, not a degraded fallback.
+The coordination half is **already portable** (any MySQL: Cloud SQL, self-hosted, Vitess) and
+needs no code change. The only thing tying the backend to AWS is the object-store implementation —
+so the design is: **swap the `objStore` implementation per provider, keep everything else.**
 
-We *prove* the run-anywhere claim by **standing up the conformance CI on GCP** (GCS via
-S3-interoperability + Cloud SQL, authenticated with Workload Identity) instead of AWS
-(S3 + Aurora + ECS/Fargate). GCP is the demonstration vehicle precisely because it's the
-*hardest* target — it needs both the conditional-write translation and keyless auth — so if it
-passes there, MinIO/on-prem/AWS are comparatively easy.
+The hard part is one primitive: **atomic create-if-absent** (`setObjectIfNoneMatch`), which makes
+concurrent integrators safe. The whole client/library question reduces to *"which object client
+exposes a reliable create-if-absent on this provider?"* — answered in §3.
 
-The goal is **not** a rewrite. The backend already accepts an injectable SDK config and an
-`S3Options` hook. The real work is: (1) resolve the one true incompatibility (conditional writes),
-(2) make endpoint **and pluggable auth** configuration first-class and documented, and (3) stand
-up a GCP conformance pipeline mirroring the AWS one.
+**Two principles still drive the design:**
+
+1. **Run anywhere, no lock-in** — same coordination + integration code on managed cloud and fully
+   on-prem (k8s + MinIO + MySQL).
+2. **Auth is the operator's choice** — keyless where the platform offers it (GCS: native Workload
+   Identity; AWS/MinIO/Ceph: STS web-identity), and long-lived keys as a **first-class** option,
+   never a degraded fallback.
 
 ## Deployment targets & auth (the portability matrix)
 
-All of these run the **same** backend code; only configuration differs. None is privileged in the
-code — GCP is just the one we wire into CI first.
+Same coordination + integration code everywhere; only the `objStore` impl and config differ.
 
-| Target | Object store | Coordination | Auth options |
+| Target | Object store (impl) | Coordination | Auth |
 |---|---|---|---|
-| **GCP** | GCS (S3-interop) | Cloud SQL (MySQL) | **Keyless: Workload Identity (bearer, S3)** *or* HMAC keys |
-| **On-prem / anywhere** | MinIO, Ceph/RGW | MySQL on k8s | **Keyless: STS web-identity from k8s SA (S2)** *or* HMAC keys |
-| **AWS** | S3 | Aurora (MySQL) | **Keyless: IRSA / IAM roles (S2, native)** *or* HMAC keys — unchanged |
-| **Other** | Cloudflare R2, etc. | any MySQL | HMAC keys (no keyless S3 path today) |
+| **GCP** | GCS via **native client** (or `gocloud` gcsblob) | Cloud SQL (MySQL) | **Native ADC / Workload Identity — zero secrets** |
+| **On-prem / anywhere** | MinIO, Ceph/RGW via **S3 client** (or `gocloud` s3blob) | MySQL on k8s | STS web-identity from k8s SA *or* HMAC keys |
+| **AWS** | S3 via existing client | Aurora (MySQL) | IAM role / IRSA *or* HMAC keys — **unchanged** |
+| **Other** | Cloudflare R2 via S3 client | any MySQL | HMAC/API-token keys (no STS/OIDC path) |
 
-Design rule: **keyless identity where the platform offers it; long-lived secrets as an equal,
-supported choice everywhere.** Operators who are happy managing a secret should never be forced
-into a federation setup, and operators who want zero secrets should never be forced to mint one.
+Design rule: **native keyless identity where the platform offers it; long-lived secrets an equal,
+supported choice everywhere.**
 
 ## Background: what the "AWS" backend actually is
 
-From `storage/aws/aws.go` (~1,600 LOC, verified against upstream `63f846b`):
+From `storage/aws/aws.go` (~1,600 LOC at upstream `63f846b`; cite by symbol, not line — the file
+churns, e.g. +457 lines in one recent sync):
 
 | Concern | Implementation | AWS-specific? |
 |---|---|---|
-| Serve bundles/tiles/checkpoints | S3 object API (`GetObject`/`PutObject`/`ListObjectsV2`/`DeleteObjects`) | Protocol only |
-| Write coordination | MySQL/Aurora tables: `SeqCoord`, `Seq`, `IntCoord`, `PubCoord`, `GCCoord` | No — plain MySQL |
-| Credentials / client | `aws-sdk-go-v2` `config.LoadDefaultConfig` + `s3.NewFromConfig` | Yes, but injectable |
+| Object access | `objStore` interface → `s3Storage` (aws-sdk-go-v2) | **Interface: no.** Impl: yes |
+| Write coordination | MySQL tables, standard SQL (`FOR UPDATE`, `INSERT IGNORE`) | No — plain MySQL |
+| Client construction | `config.LoadDefaultConfig` + `s3.NewFromConfig` | Yes, but injectable |
 
-Key existing seams (already public, already portable):
+The reusable seam — **`objStore`** (`type objStore interface` in `aws.go`):
 
-- `Config.SDKConfig *aws.Config` — caller can supply any `aws.Config`, including a custom
-  endpoint resolver and static credentials. (`storage/aws/aws.go:150`)
-- `Config.S3Options func(*s3.Options)` — caller can mutate the S3 client options, e.g. set
-  `BaseEndpoint`, force path-style addressing, or register middleware. (`storage/aws/aws.go:155`)
-- **`objStore` interface** — object access (`getObject`/`setObject`/`setObjectIfNoneMatch`) now
-  goes through an interface (`storage/aws/aws.go:110`), not the concrete S3 client directly. This
-  is a *better* seam than middleware: we can supply a GCS-native `objStore` implementation
-  (translated precondition + bearer auth) without touching the integration/coordination logic.
-- MySQL is a DSN — Cloud SQL, self-hosted, Vitess, etc. all work unchanged.
+```go
+type objStore interface {
+    getObject(ctx, obj) ([]byte, error)
+    setObject(ctx, obj, data, contentType, cacheControl) error
+    setObjectIfNoneMatch(ctx, obj, data, contentType, cacheControl) error   // ← the hard one
+    deleteObjectsWithPrefix(ctx, prefix) error
+}
+```
 
-The README already concedes the backend "may work" on other S3/MySQL-compatible stores, but
-declares it **unsupported** and warns that out-of-AWS PRs are "unlikely to be accepted unless
-shown to have no detrimental effect on AWS performance." → This is why the work lives in a
-**fork** and is structured to be *additive* (no behavior change on the AWS path).
+**Important constraint (corrects rev 1's "clean seam" claim):** `objStore`, its methods, the
+`s3Storage` impl, *and* the MySQL `sequencer`/integration code are all **unexported**, inside
+package `aws`. Consequences:
 
-## The one true blocker: conditional create-if-absent writes 🧨
+- A new `objStore` impl **must live in package `aws`** (or upstream must export a shared package).
+- Selecting it still requires a **small edit to the constructor** to branch on a `Dialect`. So this
+  is *not* zero-diff — it's "one new file + one constructor branch." That's the realistic minimum,
+  and the right target given the rebase tax below.
 
-`s3Storage.setObjectIfNoneMatch` (`storage/aws/aws.go:1526`) writes tiles/checkpoints with the
-S3 header **`If-None-Match: "*"`** to get atomic *create-only* semantics (and idempotency on
-retry). This is the correctness-critical primitive that makes concurrent integrators safe.
+The README declares non-AWS use **unsupported** and says such PRs are "unlikely to be accepted
+unless shown to have no detrimental effect on AWS performance." → permanent fork; **minimize the
+diff to existing files** so rebases against a fast-moving upstream stay cheap.
 
-**GCS over S3-interop does NOT honor `If-None-Match: "*"` on PUT.** Per the GCS XML API
-reference, conditional create is expressed with the GCS-native header
-**`x-goog-if-generation-match: 0`** ("perform the request only if the object does not currently
-exist"). `If-None-Match` is documented only for GET/HEAD ETag matching.
+## The core primitive: atomic create-if-absent
 
-Sources:
-- GCS XML API reference headers: <https://docs.cloud.google.com/storage/docs/xml-api/reference-headers>
-- GCS interoperability / S3 migration: <https://docs.cloud.google.com/storage/docs/interoperability>
+`setObjectIfNoneMatch` writes tiles/bundles/checkpoints with create-only semantics (and treats an
+existing **byte-identical** object as idempotent success). The current S3 impl uses
+`If-None-Match: "*"` and keys idempotency off `smithy.APIError.ErrorCode() == "PreconditionFailed"`.
 
-### Consequence
+How each candidate object client provides this primitive:
 
-Pointed naively at GCS, `setObjectIfNoneMatch` would degrade to an unconditional PUT — the
-precondition is ignored, so the create-only guarantee is **silently lost**. That breaks the
-safety the integrator relies on. Any "runs on GCS" claim must close this gap.
+| Provider | Native primitive | Notes |
+|---|---|---|
+| AWS S3 / MinIO / Ceph / R2 | `If-None-Match: "*"` | Works on the existing S3 impl today |
+| **GCS (native client)** | `obj.If(storage.Conditions{DoesNotExist:true})` → 412 | ✅ clean; **not** available via S3-interop |
+| **`gocloud.dev/blob`** | `WriterOptions.IfNotExist=true` → `gcerrors.PreconditionFailed` | ✅ portable across gcsblob/s3blob/etc. |
 
-### Proposed fix: an S3-client middleware that translates the precondition
+> ⚠️ **GCS over S3-interop does NOT honor `If-None-Match:"*"`** (it uses `x-goog-if-generation-match: 0`).
+> This was rev 1's central blocker — now **avoided** by not using S3-interop for GCS.
 
-The `aws-sdk-go-v2` S3 client supports request middleware via `APIOptions` (reachable through
-the existing `S3Options` hook). We register a finalize/serialize-step middleware that, when the
-target is GCS, rewrites the outbound HTTP request:
+## 3. Object-store client strategy (the heart of rev 2)
 
-- detects the `If-None-Match: *` header on `PutObject`,
-- removes it, and sets `x-goog-if-generation-match: 0`,
-- maps the GCS precondition-failure response (HTTP 412) back to the same
-  `smithy.APIError` code path the existing code already handles (`PreconditionFailed`),
-  so the idempotency branch (compare-existing-bytes) keeps working unchanged.
+The `objStore` interface is the portability seam. Three ways to fill it; we recommend A now, B next.
 
-This keeps the translation **entirely outside** the core storage logic and **zero-cost on AWS**
-(middleware only activates for the GCS endpoint), satisfying the "no detriment to AWS" rule.
+### Option A — Per-provider native impls (recommended to start; GCS now) ✅
+- **AWS / MinIO / Ceph / R2:** keep the existing `s3Storage` (aws-sdk-go-v2). Unchanged.
+- **GCS:** new `gcsStore` implementing `objStore` with `cloud.google.com/go/storage`:
+  - `setObjectIfNoneMatch` → `obj.If(storage.Conditions{DoesNotExist:true}).NewWriter`; on
+    `*googleapi.Error` code 412, fall back to byte-compare for idempotency (mirrors current logic).
+  - `deleteObjectsWithPrefix` → objects iterator + per-object delete (sidesteps S3 batch-delete).
+  - Auth → `storage.NewClient(ctx)` uses **ADC / Workload Identity** automatically. **No HMAC, no
+    bearer hacking, no SigV4 stripping.**
+- **Why first:** GCS is required short-term, and this is the *smallest, lowest-risk* way to get a
+  correct, secret-less GCS backend. It deletes rev 1's three GCS-only blockers outright.
+- **Cost:** a GCS-specific file lives in package `aws` (naming smell — see Open Questions) and adds
+  the `cloud.google.com/go/storage` dependency to that build.
 
-**Alternative seam (possibly cleaner):** upstream now routes object access through an `objStore`
-interface (`aws.go:110`). Rather than rewriting HTTP at the SDK layer, we can provide a GCS-native
-`objStore` implementation that issues the correct precondition (and bearer auth, §2) directly,
-while reusing the identical integration/coordination code. The Phase-0 spike should try both and
-keep whichever is simpler to maintain.
+### Option B — Unify on `gocloud.dev/blob` (evaluate next; the run-anywhere endgame)
+- One `objStore` impl over `*blob.Bucket`; pick driver by URL (`gs://`, `s3://`, `file://`, `mem://`).
+  `WriterOptions.IfNotExist` gives the create-if-absent primitive uniformly; auth is each driver's
+  native chain (gcsblob → ADC/WIF; s3blob → SDK chain incl. STS/HMAC).
+- **Upside:** genuinely one implementation for GCS + AWS + MinIO + Ceph + R2 + local; Google-maintained.
+- **Must verify before adopting (spike):** that `IfNotExist` is honored by **s3blob against MinIO/R2/Ceph**
+  and by **gcsblob**, and that error semantics + cache-control/content-type pass through. The Go CDK
+  docs explicitly warn "driver support varies."
+- **Trade-off:** new dependency; less low-level control than the raw SDKs.
 
-> ⚠️ Spike required: confirm (a) GCS returns 412 with a smithy-classifiable code, and (b) path-style
-> addressing + HMAC V4 signing interplay with the injected header. This is the riskiest assumption
-> and should be proven first (see Phase 0).
+### Option C — S3-interop-to-GCS + middleware (rev 1; **rejected**)
+Rejected because it is maximal-effort for a non-production config and still must solve, on GCS:
+batch-delete incompatibility, chunked-PUT-vs-SigV4, HMAC org-policy blocks, and brittle error-code
+mapping (all detailed in Risks). Documented here so the rejection is on record.
+
+## 4. Authentication
+
+With Option A/B, auth is **much simpler than rev 1** because GCS uses its native client.
+
+- **GCS — native ADC / Workload Identity (zero secrets).** `storage.NewClient` resolves WIF on
+  GKE/Cloud Run, WIF federation in GitHub Actions, or `gcloud` locally. No HMAC, no bearer middleware.
+- **AWS / MinIO / Ceph — pick one, both first-class:**
+  - *Static HMAC keys* (SigV4): the existing default; works everywhere S3 does.
+  - *Keyless STS web-identity:* exchange a k8s projected ServiceAccount JWT at the store's STS
+    `AssumeRoleWithWebIdentity` endpoint for temporary SigV4 creds. **Native in the SDK on AWS
+    (IRSA — zero new code)**; for MinIO/Ceph, point `stscreds.WebIdentityRoleProvider` at their STS
+    endpoint. Config shape: *(token source, STS endpoint, role)*.
+- **R2 / other:** API-token / access-key only (no OIDC/STS) — Strategy-1 only. Honest limit:
+  keyless is "general where the protocol allows it," not universal.
+
+The bearer-token-over-S3 approach from rev 1 is **no longer needed** — it only existed to force
+S3-interop onto GCS, which we now avoid. (Kept in git history for reference.)
+
+## 5. Coordination store (unchanged — verified)
+
+No code change. The schema is vanilla MySQL (`CREATE TABLE … IF NOT EXISTS`, `INSERT IGNORE`,
+`SELECT … FOR UPDATE`); no Aurora-specific SQL. Cloud SQL (MySQL 8.0), self-hosted, or on-prem
+MySQL accept it as-is. CI connects via the Cloud SQL Auth Proxy or private IP.
+
+**Strategic caveat (S2):** coordination remains a single MySQL serialization point
+(`SELECT … FOR UPDATE`). That is the throughput ceiling the *native* `storage/gcp` backend uses
+Spanner to avoid. "Run anywhere" inherits the MySQL coordination ceiling — acceptable for the
+portability goal, but a known limit, not a cloud-native scaling story.
+
+## 6. CI plan — GCS first, MinIO-on-GKE second
+
+Per the substrate decision (do both; GCS is required short-term):
+
+- **CI lane 1 (now): GCS + Cloud SQL on GCP**, auth via Workload Identity Federation. Exercises the
+  native-GCS `objStore`. Mirror `aws_integration_test.yml`'s lifecycle (build → deploy ephemeral
+  infra → run hammer → tear down) with GCP analogues.
+- **CI lane 2 (next): MinIO-on-GKE + Cloud SQL.** Cheapest, most faithful proof of the *portable
+  S3 path* and the on-prem story; no GCS quirks. Add once lane 1 is green.
+
+| AWS today | GCP analogue |
+|---|---|
+| OIDC → `configure-aws-credentials` | WIF → `google-github-actions/auth` |
+| ECR | Artifact Registry |
+| ECS/Fargate task (conformance + hammer) | Cloud Run jobs **or** GKE Job |
+| Aurora MySQL | Cloud SQL (MySQL 8.0) |
+| S3 bucket | GCS bucket (lane 1) / MinIO on GKE (lane 2) |
+| Terragrunt `live/aws/conformance/ci` | new `live/gcp/conformance/{gcs,minio}/` |
+
+New Terraform/Terragrunt under `deployment/modules/gcp/`: GCS bucket + IAM (no HMAC needed),
+Cloud SQL, Artifact Registry, Cloud Run/GKE job, WIF service account. The conformance **binary**
+must construct the new `Dialect` config — so expect a new/extended `cmd/conformance/gcs/main.go`,
+not just a Dockerfile reuse.
+
+> The repo already has `deployment/live/gcp/...` + `deployment/modules/gcp/gcs` for the *Spanner*
+> backend. Keep this pipeline in a clearly separate path to avoid collision.
+
+## Relationship to existing GCP work
+
+- **`storage/gcp` (native GCS + Spanner)** already exists. This design is deliberately different:
+  native GCS object store **+ MySQL** coordination, reusing `storage/aws`'s sequencer/integration.
+  The point is portability of the *coordination + integration* code across providers, not a second
+  Spanner backend. (If MySQL-coordination scaling becomes the bottleneck, the Spanner backend is
+  the answer — see S2.)
+- **Firestore plan** (`firestore-plan` branch): a fully native, GCP-only backend (Firestore as both
+  store and coordinator; native WIF; 1 MiB/doc bundle-chunking concern). Deferred. If "run
+  anywhere" stops being the priority, that's the cleaner *GCP-only* answer.
 
 ## Goals / Non-goals
 
 **Goals**
-- **Run anywhere on the same code:** the backend runs unchanged on GCS+Cloud SQL, on
-  **on-prem k8s + MinIO + MySQL**, on AWS S3+Aurora, and on other S3/MySQL-compatible stores —
-  no vendor lock-in, no per-target code paths beyond config.
-- **Operator-chosen auth, both first-class:** keyless Workload Identity *and* long-lived HMAC keys
-  are fully supported; choosing secrets is never a degraded mode.
-- A GCP conformance CI pipeline that mirrors `aws_integration_test.yml` end to end
-  (build image → deploy ephemeral infra → run hammer → tear down), using Workload Identity — the
-  proof that the hardest target works.
-- All changes additive and gated; the AWS path is byte-for-byte unchanged at runtime.
+- Same coordination + integration code on GCS+Cloud SQL, on-prem k8s+MinIO+MySQL, and AWS S3+Aurora.
+- A correct, **secret-less GCS** backend via the native client (short-term necessity).
+- GCP conformance CI (lane 1), then MinIO-on-GKE CI (lane 2).
+- **Strictly additive within `storage/aws`:** new file(s) for the GCS impl + one constructor branch.
+  The AWS path is byte-for-byte unchanged at runtime. **No package rename** in the fork (rename is
+  an upstream-only concern; renaming maximizes rebase pain — see S3).
 
 **Non-goals**
-- Replacing or merging with the *existing* `storage/gcp` backend (GCS + **Spanner**). That is a
-  different design (Spanner coordination); this one keeps **MySQL** coordination and only swaps
-  the object store. Naming must avoid confusion (see Open Questions).
-- Upstreaming (for now). Revisit once the fork proves the approach and perf parity.
-- **CI coverage for *every* target.** On-prem/MinIO and other S3 stores are **first-class supported
-  targets**, not afterthoughts — but GCP is the only one we wire into *automated CI* initially
-  (it's the hardest, so it subsumes the others). A MinIO-on-k8s CI lane is a welcome stretch goal,
-  not a blocker. ("Supported" ≠ "in CI from day one".)
-
-## Design
-
-### 1. Configuration surface
-
-Add a small, explicit config path for "S3-compatible, non-AWS" usage rather than making callers
-hand-assemble an `aws.Config`:
-
-- Endpoint (e.g. `https://storage.googleapis.com`), path-style toggle, region placeholder.
-- **Pluggable auth provider (see §2):** one config-selected seam, three strategies — static HMAC
-  keys, keyless STS/web-identity (AWS/MinIO/Ceph), or keyless bearer token (GCS). Keyless is a
-  general capability, not GCP-only; no strategy is privileged in code.
-- A `Flavor`/`Dialect` enum (e.g. `AWS` | `GCS`) that decides whether the precondition-translation
-  and auth middleware are installed. Default `AWS` → no change.
-
-This can be a thin constructor wrapper that produces the `SDKConfig` + `S3Options` the existing
-`New(...)` already accepts — i.e. **no change to the core `New` signature**.
-
-### 2. Authentication: one pluggable seam, keyless as a general feature
-
-Auth is a **pluggable provider**, not a hard-coded mode. The backend selects a credential/auth
-strategy from config; the integration and coordination code never sees the difference. **Keyless
-is designed as a general capability, not a GCP special-case** — and it's feasible largely because
-two of the three strategies already live in the AWS SDK's credential chain. Only the GCS bearer
-path is bespoke.
-
-**Strategy 1 — Static HMAC keys (works everywhere).** Long-lived access key + secret, SigV4. The
-default today on AWS; works unchanged on MinIO, Ceph/RGW, Cloudflare R2, and GCS HMAC interop. The
-zero-infrastructure choice; pair with a k8s Secret / Secret Manager / env. A first-class, fully
-supported option — not a fallback.
-
-**Strategy 2 — Keyless via STS web-identity → temporary SigV4 creds (the *general* keyless path).**
-The S3-native way to be keyless; generalises across any store exposing an STS
-`AssumeRoleWithWebIdentity` endpoint:
-
-- **AWS:** EKS **IRSA** / instance / task roles — the SDK's default chain already exchanges the
-  projected token (`AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN`) for temporary creds. **Zero new code.**
-- **MinIO** and **Ceph/RGW:** both implement STS `AssumeRoleWithWebIdentity`. A pod's projected
-  Kubernetes ServiceAccount JWT is exchanged at the store's STS endpoint for short-lived SigV4
-  creds; the SDK's `stscreds.WebIdentityRoleProvider` does this once pointed at the store's STS
-  endpoint.
-
-So a single config shape — *(identity-token source, STS endpoint, role)* — covers keyless on AWS,
-MinIO, and Ceph. This is mostly **SDK configuration**, not new signing code.
-
-**Strategy 3 — Bearer token, no SigV4 (stores whose object API speaks OIDC directly).** Some stores
-accept an OAuth/OIDC bearer token *instead of* SigV4. **GCS's XML API** is the motivating case: we
-obtain a short-lived token from a `TokenSource` (ADC → Workload Identity on GKE/Cloud Run, WIF in
-CI, or `gcloud` locally), **remove the SDK's SigV4 signer**, and attach `Authorization: Bearer
-<token>`, refreshing as it nears expiry. This strategy is provider-specific by nature (it isn't S3
-protocol), but the *seam* is generic: any future store that authenticates by bearer token plugs in
-here with its own `TokenSource`.
-
-**Unifying abstraction.** Strategies 2 and 3 both reduce to a **`TokenSource`** (ambient workload
-identity — k8s projected SA token, cloud metadata, OIDC) plus an **`Authenticator`** that turns it
-into request auth: either *exchange-for-SigV4* (S2) or *present-as-bearer* (S3). Strategy 1 is just
-an `Authenticator` backed by static keys. **One interface, three implementations, chosen by config.**
-
-| Provider | Keyless mechanism | Build effort |
-|---|---|---|
-| AWS (S3) | S2 — STS / IRSA, **native in SDK** | none — works today |
-| MinIO | S2 — STS `AssumeRoleWithWebIdentity` | point SDK STS provider at MinIO endpoint |
-| Ceph / RGW | S2 — STS `AssumeRoleWithWebIdentity` | same shape as MinIO |
-| GCP (GCS) | S3 — bearer token (ADC / WIF) | the bespoke bit; gated by Phase-0 spike |
-| Cloudflare R2 | — none (S3 access keys only) | use Strategy 1 |
-
-**Honest limits:** R2 has no OIDC/STS path for its S3 API today, so it's Strategy-1-only — keyless
-is "general where the protocol allows it," not literally universal. And Strategy 3 must clear the
-Phase-0 spike (can we cleanly drop SigV4 in `aws-sdk-go-v2` and have GCS accept the bearer token).
-
-> ⚠️ Spike scope (Phase 0): **(a)** GCS bearer-token path [Strategy 3]; **(b)** MinIO STS
-> web-identity exchange [Strategy 2] from a fake k8s token → temporary SigV4 creds. Proving (a)+(b)
-> validates the *general* keyless design end to end; Strategy 1 needs no proof. If (a) fails, GCP
-> keyless falls back to GCS HMAC keys without affecting S2/S1 elsewhere.
-
-### 3. Object-store compatibility
-
-- Install the conditional-write middleware when `Dialect == GCS`.
-- Force path-style addressing (GCS interop + dotted bucket names → virtual-host TLS issues).
-- Verify `ListObjectsV2` + batch `DeleteObjects` (used by GC, `aws.go:1574`) behave on GCS;
-  GCS supports these via XML API but pagination/markers should be smoke-tested.
-
-### 4. Coordination store
-
-No code change expected — point the MySQL DSN at Cloud SQL (MySQL 8.0). CI uses the Cloud SQL
-Auth Proxy or a private IP from the runner/job. Validate schema bootstrap
-(`Tessera`/`SeqCoord`/...) applies cleanly on Cloud SQL.
-
-### 5. GCP conformance CI (the "port the CI" half)
-
-Mirror `aws_integration_test.yml`, swapping each AWS primitive for its GCP analogue:
-
-| AWS (today) | GCP (proposed) |
-|---|---|
-| OIDC → `aws-actions/configure-aws-credentials` | Workload Identity Federation → `google-github-actions/auth` |
-| ECR (image registry) | Artifact Registry |
-| ECS/Fargate task run (conformance + hammer) | Cloud Run jobs **or** GKE Job |
-| Aurora MySQL | Cloud SQL (MySQL 8.0) |
-| S3 bucket | GCS bucket (interop enabled) |
-| HMAC access keys (static secret) | **WIF → short-lived OAuth bearer token** — no stored secret |
-| Terragrunt `deployment/live/aws/conformance/ci` | new `deployment/live/gcp/conformance/interop/` |
-| `cmd/conformance/aws/Dockerfile` | reuse, or `cmd/conformance/gcs/Dockerfile` |
-
-New Terraform/Terragrunt modules under `deployment/modules/gcp/` for: GCS bucket + HMAC key,
-Cloud SQL instance, Artifact Registry repo, Cloud Run/GKE job definitions, and the WIF service
-account. A new workflow `gcp_interop_integration_test.yml` orchestrates build → apply → hammer →
-destroy, matching the AWS one's lifecycle (including pre-destroy cleanup).
-
-> Note: the repo already has `deployment/live/gcp/...` and `deployment/modules/gcp/gcs` for the
-> *Spanner* backend. Keep the interop pipeline in a clearly separate path to avoid collision.
-
-## Relationship to the Firestore backend plan
-
-This fork already carries `FIRESTORE_IMPLEMENTATION_PLAN.md` — a plan for a *native*
-`storage/firestore/` backend where Firestore is **both** the object store (documents for
-tiles/bundles/checkpoints) **and** the coordinator (Firestore transactions replace MySQL). That's
-a different philosophy, and the Workload-Identity requirement sharpens the contrast:
-
-| | This doc: S3-interop + MySQL | Firestore backend |
-|---|---|---|
-| Code reuse | ~1,600 LOC of `storage/aws` largely as-is | New backend, roughly `aws.go`-sized |
-| "Runs anywhere" | ✅ one backend → AWS, GCS, MinIO, R2, Ceph | ❌ GCP-only (Firestore) |
-| Workload Identity | ⚠️ needs the bearer-token middleware spike | ✅ native — Firestore Go client uses ADC/IAM, **no secrets ever** |
-| Coordination | proven MySQL transaction design | Firestore txns — new concurrency model to validate |
-| Object-size limits | n/a (object store) | ⚠️ 1 MiB/doc — entry bundles may need chunking |
-
-- If **"cloud-agnostic, runs anywhere"** is the priority → this S3-interop design.
-- If **"cleanest GCP-native, secret-less"** is the priority → the Firestore backend wins on auth
-  outright, but gives up portability.
-- **Hybrid worth considering:** S3-interop object store for the portable serving path **+**
-  Firestore (or Spanner) for coordination only. Keeps "runs anywhere" for reads while getting
-  native, secret-less coordination on GCP — at the cost of two code paths.
-
-These aren't mutually exclusive, but they shouldn't be pursued blindly in parallel. Recommend
-deciding the coordination story before writing backend code.
+- Replacing/merging the existing `storage/gcp` (Spanner) backend.
+- Upstreaming (for now) — revisit after the fork proves it; expect to carry a permanent diff.
+- CI for *every* target from day one (MinIO lane is lane 2, not a blocker). "Supported" ≠ "in CI".
 
 ## Phased plan
 
-- **Phase 0 — De-risk (spike, throwaway):** Two proofs.
-  **(1) Conditional write:** AWS SDK → real GCS bucket; prove `setObjectIfNoneMatch` via the
-  translated `x-goog-if-generation-match: 0` header (first write OK; second gets 412 → idempotency
-  branch).
-  **(2) General keyless auth:** prove Strategy 3 (GCS bearer token from ADC, SigV4 stripped) *and*
-  Strategy 2 (MinIO STS `AssumeRoleWithWebIdentity` from a k8s-style token → temporary SigV4 creds).
-  MinIO runs locally, so S2 is cheap to prove first; it also validates the conditional write on a
-  second S3 implementation. **Go/no-go gate for the whole approach.**
-- **Phase 1 — Backend config + middleware:** Add the `Dialect`/constructor wrapper and the
-  precondition-translation middleware. Unit tests + a GCS-backed integration test (build-tagged,
-  skipped without creds). No change to AWS behavior.
-- **Phase 2 — Terraform/Terragrunt GCP modules:** GCS+HMAC, Cloud SQL, Artifact Registry,
-  Cloud Run/GKE job, WIF. Apply/destroy locally.
-- **Phase 3 — CI workflow:** `gcp_interop_integration_test.yml` mirroring the AWS lifecycle;
-  run the hammer to conformance-completion; ensure teardown is reliable.
-- **Phase 4 — Docs + (optional) rename:** README for the interop backend; decide on package
-  naming; write up perf observations vs AWS.
+- **Phase 0 — De-risk spike (throwaway).** Prove the **native-GCS `objStore`** end-to-end against a
+  real GCS bucket with **Workload Identity** (confirm the target project's org policy permits the
+  intended auth — `constraints/storage.restrictAuthTypes` etc.):
+  1. `setObjectIfNoneMatch` via `Conditions{DoesNotExist:true}` — first write OK; second → 412 →
+     byte-compare idempotency branch.
+  2. `deleteObjectsWithPrefix` via iterator + per-object delete.
+  3. list/iterate semantics for any prefix scans.
+  4. auth: client works from ADC/WIF with **no static key**.
+  Optionally spike **Option B** (`gocloud.dev/blob` `IfNotExist` on gcsblob **and** s3blob/MinIO) to
+  decide whether to converge. **Go/no-go gate.**
+- **Phase 1 — GCS objStore in-tree.** Add `gcsStore` (package `aws`) + a `Dialect` branch in the
+  constructor. Unit tests + a GCS integration test (build-tagged, skipped without creds). AWS path
+  unchanged.
+- **Phase 2 — GCP infra (Terraform/Terragrunt):** GCS + IAM (no HMAC), Cloud SQL, Artifact Registry,
+  Cloud Run/GKE job, WIF SA. Apply/destroy locally.
+- **Phase 3 — CI lane 1:** `gcp_gcs_integration_test.yml` mirroring the AWS lifecycle; hammer to
+  conformance; reliable teardown.
+- **Phase 4 — Run-anywhere:** CI lane 2 (MinIO-on-GKE); evaluate adopting Option B to unify impls.
+- **Phase 5 — Docs + naming:** README; revisit package naming (upstream/long-term only).
 
 ## Risks / open questions
 
-1. **Conditional-write translation correctness** — the whole thing hinges on Phase 0. If GCS
-   won't surface a clean 412 through the SDK, fallback is a thin object-store interface with a
-   GCS-native code path (heavier; closer to forking `storage/aws`).
-2. **Other silent S3-interop gaps** — multipart upload thresholds, `DeleteObjects` batch
-   semantics, ListV2 pagination, ETag format assumptions. Smoke-test each.
-3. **Compute choice** — Cloud Run jobs (simplest, serverless, matches Fargate ergonomics) vs GKE
-   (closer to ECS networking model, more control). Lean Cloud Run jobs unless networking to
-   Cloud SQL forces GKE.
-4. **Naming / package identity** — `storage/aws` doing GCS is confusing, and `storage/gcp`
-   already means GCS+Spanner. Options: keep `storage/aws` + dialect flag (least churn), or extract
-   a shared `storage/s3` used by both an `aws` and `gcs-interop` thin wrapper. Fork can be bold.
-5. **Cost & CI runtime** — Aurora bring-up is already the slow part on AWS; Cloud SQL has similar
-   cold-start. Consider keeping a long-lived CI instance vs per-run create/destroy.
-6. **Bearer-token auth vs the SDK** — replacing SigV4 with an OAuth bearer token inside
-   `aws-sdk-go-v2` is the second-riskiest assumption after conditional writes. Both must clear
-   Phase 0 together, since they're exercised by the same PUT path. If either fails on GCS, the
-   Firestore-native path (below) starts to look more attractive precisely because it sidesteps
-   both.
-7. **Keyless generality has edges** — (a) **R2 (and possibly other S3 clones) have no STS/OIDC**,
-   so keyless can't be universal; Strategy 1 must always remain a first-class option. (b) STS
-   web-identity needs per-provider config of *token audience*, *role mapping*, and *STS endpoint* —
-   easy to misconfigure; document a known-good MinIO + k8s recipe. (c) Token lifetime/refresh and
-   clock skew must be handled in the `Authenticator` for both S2 and S3 (long-running integrators
-   outlive a single token).
+1. **🔴 Native-GCS objStore correctness** — the spike must confirm create-if-absent 412 handling,
+   per-object delete, list semantics, and content-type/cache-control parity with the S3 impl.
+2. **🟠 Org policy on the GCP project** — `constraints/storage.restrictAuthTypes` can block HMAC
+   (and this is a locked-down corporate GCP context — web search was already org-policy-blocked).
+   Native-client + WIF sidesteps HMAC entirely, but confirm WIF/SA permissions exist before Phase 0.
+3. **🟠 `gocloud.dev/blob` driver parity (Option B)** — verify `IfNotExist` on s3blob/MinIO/R2 and
+   gcsblob, plus error + metadata passthrough, before betting the unification on it.
+4. **🟠 Unexported reuse / rebase tax** — `objStore`, `sequencer`, integration are unexported in
+   package `aws`; the GCS impl must live there and add one constructor branch. Keep the diff tiny;
+   upstream churns `aws.go` heavily (+457 lines in one sync).
+5. **🟠 Naming smell** — a GCS-native file inside `storage/aws` is confusing, and `storage/gcp`
+   already means GCS+Spanner. Tolerate in the fork (minimal diff); only resolve via rename if/when
+   upstreaming.
+6. **🟠 MySQL coordination ceiling (S2)** — single `FOR UPDATE` serialization point; fine for the
+   portability goal, not a scaling story. Spanner backend remains the answer if that bites.
+7. **🟡 Compute choice** — Cloud Run jobs (simplest, Fargate-like) vs GKE Job (closer to ECS
+   networking; may be needed for Cloud SQL connectivity). Lean Cloud Run jobs.
+8. **🟡 CI cost/runtime** — Cloud SQL bring-up is slow (as Aurora is today); consider a long-lived
+   CI instance vs per-run create/destroy.
+9. **🟡 Rejected S3-interop-to-GCS landmines (for the record)** — batch-delete format mismatch,
+   "chunked transfer encoding + V4 signatures can't be used simultaneously" on GCS, unverified
+   `list-type=2`, and `If-None-Match:"*"` ignored. All avoided by Option A/B; listed so Option C
+   stays rejected for the right reasons.
 
-## Appendix: key code references
+## Appendix: key code references (by symbol — line numbers rot)
 
-- `storage/aws/aws.go:110` — `objStore` interface (cleanest seam for a GCS-native implementation)
-- `storage/aws/aws.go:150` — `Config.SDKConfig` injection point
-- `storage/aws/aws.go:155` — `Config.S3Options` hook (SDK middleware entry point)
-- `storage/aws/aws.go:179` — default `config.LoadDefaultConfig`
-- `storage/aws/aws.go:1526` — `setObjectIfNoneMatch` impl; `IfNoneMatch:"*"` at `:1538`
-- `storage/aws/aws.go:1574` — `ListObjectsV2` + `DeleteObjects` (GC path)
-- Verified against upstream `63f846b`; the standalone `storage/mysql` backend was removed upstream,
-  but `storage/aws` still embeds MySQL coordination (`SeqCoord`/`IntCoord`/... at `:947`+).
-- `.github/workflows/aws_integration_test.yml` — the pipeline to mirror on GCP
-- `deployment/live/aws/conformance/`, `deployment/modules/aws/` — Terragrunt to mirror
+- `objStore` interface + `s3Storage` impl — `storage/aws/aws.go`
+- `setObjectIfNoneMatch` — the create-if-absent primitive; idempotency keys off
+  `smithy.APIError.ErrorCode() == "PreconditionFailed"` (must be re-implemented for the GCS 412 path)
+- `deleteObjectsWithPrefix` — GC path; currently S3 `ListObjectsV2` + batch `DeleteObjects`
+- `Config.SDKConfig` / `Config.S3Options` — injection points (still used by the S3 impl)
+- MySQL coordination — `SeqCoord`/`Seq`/`IntCoord`/`PubCoord`/`GCCoord`, standard SQL
+- Native GCS client — `cloud.google.com/go/storage`: `ObjectHandle.If(Conditions{DoesNotExist:true})`,
+  `NewWriter`, errors via `*googleapi.Error` (Code 412)
+- Go CDK — `gocloud.dev/blob`: `WriterOptions.IfNotExist`, `gcerrors.PreconditionFailed`
+- CI to mirror — `.github/workflows/aws_integration_test.yml`; `deployment/{live,modules}/aws/`
+- Verified against upstream `63f846b`; standalone `storage/mysql` removed upstream, but
+  `storage/aws` still embeds MySQL coordination.
