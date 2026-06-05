@@ -34,7 +34,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"path/filepath"
+	"path"
 
 	gcs "cloud.google.com/go/storage"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -76,7 +76,7 @@ func newGCSStore(ctx context.Context, bucket, bucketPrefix string, opts ...optio
 // layout produced by s3Storage.
 func (s *gcsStore) objectName(obj string) string {
 	if s.bucketPrefix != "" {
-		return filepath.Join(s.bucketPrefix, obj)
+		return path.Join(s.bucketPrefix, obj)
 	}
 	return obj
 }
@@ -98,12 +98,13 @@ func (s *gcsStore) getObject(ctx context.Context, obj string) ([]byte, error) {
 		}
 		return nil, fmt.Errorf("getObject: failed to create reader for object %q in bucket %q: %w", objName, s.bucket, err)
 	}
+	defer r.Close()
 
 	d, err := io.ReadAll(r)
 	if err != nil {
 		return nil, fmt.Errorf("getObject: failed to read %q: %v", objName, err)
 	}
-	return d, r.Close()
+	return d, nil
 }
 
 // setObject stores the provided data in the specified object.
@@ -115,8 +116,8 @@ func (s *gcsStore) setObject(ctx context.Context, objName string, data []byte, c
 	w.CacheControl = cacheControl
 
 	if _, err := w.Write(data); err != nil {
-		// Best-effort cleanup; the write has already failed.
-		_ = w.Close()
+		// Abort the upload so the writer's resources are released.
+		_ = w.CloseWithError(err)
 		return fmt.Errorf("failed to write object %q to bucket %q: %w", name, s.bucket, err)
 	}
 	if err := w.Close(); err != nil {
@@ -140,9 +141,12 @@ func (s *gcsStore) setObjectIfNoneMatch(ctx context.Context, objName string, dat
 	w.CacheControl = cacheControl
 
 	// The precondition failure may surface on either Write or Close, so collect
-	// the first error from the write/close sequence.
+	// the first error from the write/close sequence. On a write error abort the
+	// writer with CloseWithError so its resources are released; otherwise the
+	// (possibly precondition) error surfaces from Close.
 	writeErr := func() error {
 		if _, err := w.Write(data); err != nil {
+			_ = w.CloseWithError(err)
 			return err
 		}
 		return w.Close()
