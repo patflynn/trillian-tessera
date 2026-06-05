@@ -8,7 +8,11 @@ terraform {
     }
   }
 
-  required_version = "= 1.9.8"
+  # Looser than the conformance module's exact "= 1.9.8" pin: unlike upstream
+  # (which only runs `hclfmt` in CI), our apply/teardown workflows actually run
+  # `tofu init/apply`, and local dev uses the flake's newer tofu. A range keeps
+  # CI, local, and the workflows all working without an exact-version hunt.
+  required_version = ">= 1.9.8, < 2.0.0"
 }
 
 # The project number is needed to construct the Workload Identity principalSet

@@ -8,7 +8,9 @@ terraform {
     }
   }
 
-  required_version = "= 1.9.8"
+  # See ci_identity/main.tf: a range (not the conformance module's exact
+  # "= 1.9.8") so the apply/teardown workflows and local tofu all work.
+  required_version = ">= 1.9.8, < 2.0.0"
 }
 
 locals {
