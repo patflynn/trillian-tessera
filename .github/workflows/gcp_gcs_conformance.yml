@@ -78,11 +78,13 @@ jobs:
           gcloud storage buckets create "gs://${BUCKET}" \
             --location="${{ vars.GCP_REGION }}" --uniform-bucket-level-access
 
-      - name: Create per-run database
+      - name: Compute per-run database name
         run: |
-          DB="ci_${RUN_ID//-/_}"
-          echo "DB=${DB}" >> "$GITHUB_ENV"
-          gcloud sql databases create "${DB}" --instance=tessera-ci-mysql
+          # The database itself is created later, as root via SQL (see the setup
+          # step below): databases created with `gcloud sql databases create` are
+          # owned by the Cloud SQL service and are not accessible to the root user,
+          # so root could not then GRANT on them.
+          echo "DB=ci_${RUN_ID//-/_}" >> "$GITHUB_ENV"
 
       - name: Start Cloud SQL Auth Proxy (IAM auth)
         run: |
@@ -100,19 +102,20 @@ jobs:
             sleep 1
           done
 
-      - name: Grant the per-run database to the IAM user
+      - name: Create per-run database and grant it to the IAM user
         env:
           SA_EMAIL: ${{ vars.GCP_CI_SA_EMAIL }}
         run: |
           # A freshly-created Cloud SQL IAM database user can authenticate but has
           # no privileges on any database, so the conformance server (which creates
           # the coordination tables) would fail with "Access denied ... to database".
-          # Grant it full privileges on just the per-run database.
           #
           # The grant must run as a privileged user, but the --auto-iam-authn proxy
-          # forces IAM auth on every connection, and the IAM user cannot grant to
+          # forces IAM auth on every connection and the IAM user cannot grant to
           # itself. So set an ephemeral root password (keyless, via the SA's
-          # cloudsql.admin role) and run the GRANT through a second, plain proxy.
+          # cloudsql.admin role) and, through a second plain proxy, have root CREATE
+          # the database (so root owns it and can grant on it) and GRANT it to the
+          # IAM user.
           MYSQL_USER="${SA_EMAIL%%@*}"
           ROOT_PW="$(openssl rand -hex 24)"
           gcloud sql users set-password root --host=% \
@@ -129,9 +132,14 @@ jobs:
           if ! command -v mysql >/dev/null 2>&1; then
             sudo apt-get update -qq && sudo apt-get install -y -qq mysql-client
           fi
-          MYSQL_PWD="${ROOT_PW}" mysql --protocol=TCP -h 127.0.0.1 -P 3307 -u root \
-            -e "GRANT ALL PRIVILEGES ON \`${DB}\`.* TO '${MYSQL_USER}'@'%'; FLUSH PRIVILEGES;"
-          echo "Granted ALL on ${DB} to '${MYSQL_USER}'@'%'."
+          # SHOW GRANTS is printed for diagnostics if anything below fails.
+          MYSQL_PWD="${ROOT_PW}" mysql --protocol=TCP -h 127.0.0.1 -P 3307 -u root -e "
+            SELECT CURRENT_USER();
+            SHOW GRANTS FOR CURRENT_USER();
+            CREATE DATABASE IF NOT EXISTS \`${DB}\`;
+            GRANT ALL PRIVILEGES ON \`${DB}\`.* TO '${MYSQL_USER}'@'%';
+            FLUSH PRIVILEGES;"
+          echo "Created ${DB} and granted ALL on it to '${MYSQL_USER}'@'%'."
 
           kill "${ADMIN_PROXY_PID}" 2>/dev/null || true
 
