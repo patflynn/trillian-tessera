@@ -1,0 +1,254 @@
+name: GCP GCS Conformance
+
+# Exercises the native-GCS object store (storage/aws/gcs.go, selected via
+# aws.Config.ObjectStore = ObjectStoreGCS) end-to-end against real GCS + Cloud SQL
+# (MySQL) on every PR. Coordination stays on MySQL exactly as the AWS backend does;
+# only the object store differs (GCS instead of S3).
+#
+# Everything is keyless: GitHub Actions federates to GCP via Workload Identity
+# (google-github-actions/auth), the conformance server's GCS client uses the
+# resulting Application Default Credentials, and the Cloud SQL connection uses IAM
+# database authentication through the Cloud SQL Auth Proxy (--auto-iam-authn).
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # required for WIF/OIDC
+
+concurrency:
+  # Share the ci-infra-mysql group so this job serializes with the
+  # ci_infra_apply / ci_infra_teardown workflows: all three run `terragrunt` against
+  # the same ci-mysql Terragrunt state, and concurrent runs would race on the GCS
+  # state lock and on the shared Cloud SQL instance.
+  group: ci-infra-mysql
+  cancel-in-progress: false
+
+env:
+  tofu_version: '1.10.0'
+  tg_version: '0.77.22'
+  GOOGLE_PROJECT: ${{ vars.GCP_PROJECT_ID }}
+  GOOGLE_REGION: ${{ vars.GCP_REGION }}
+  TESSERA_CI_SA_EMAIL: ${{ vars.GCP_CI_SA_EMAIL }}
+  RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+
+      - name: Authenticate to GCP (keyless, WIF)
+        id: auth
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.7
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_CI_SA_EMAIL }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
+
+      # The ephemeral ci-mysql instance is torn down nightly, so recreate it on
+      # demand. This is idempotent: if it already exists, terragrunt apply is a
+      # no-op. Mirrors ci_infra_apply.yml exactly.
+      - name: Terragrunt apply ci-mysql (on demand)
+        uses: gruntwork-io/terragrunt-action@4ed5b7344c80315e5357f28f36159fc980bc2d5a # v3.4.0
+        with:
+          tofu_version: ${{ env.tofu_version }}
+          tg_version: ${{ env.tg_version }}
+          tg_dir: 'deployment/live/gcp/ci-mysql'
+          tg_command: 'apply --terragrunt-non-interactive'
+
+      - name: Create per-run GCS bucket
+        run: |
+          BUCKET="tessera-ci-${RUN_ID}"
+          echo "BUCKET=${BUCKET}" >> "$GITHUB_ENV"
+          gcloud storage buckets create "gs://${BUCKET}" \
+            --location="${{ vars.GCP_REGION }}" --uniform-bucket-level-access
+
+      - name: Compute per-run database name
+        run: |
+          # The database itself is created later, as root via SQL (see the setup
+          # step below): databases created with `gcloud sql databases create` are
+          # owned by the Cloud SQL service and are not accessible to the root user,
+          # so root could not then GRANT on them.
+          echo "DB=ci_${RUN_ID//-/_}" >> "$GITHUB_ENV"
+
+      - name: Start Cloud SQL Auth Proxy (IAM auth)
+        run: |
+          curl -fsSL -o cloud-sql-proxy \
+            https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v2.14.1/cloud-sql-proxy.linux.amd64
+          chmod +x cloud-sql-proxy
+          # Keep the proxy's logs (it runs in the background, so redirect to a file
+          # that later steps can dump for diagnostics).
+          ./cloud-sql-proxy --auto-iam-authn --port 3306 "${{ vars.GCP_SQL_CONNECTION }}" \
+            >"${{ runner.temp }}/cloud-sql-proxy.log" 2>&1 &
+          echo "PROXY_PID=$!" >> "$GITHUB_ENV"
+          echo "Waiting for Cloud SQL Auth Proxy on 127.0.0.1:3306..."
+          for i in $(seq 1 30); do
+            (echo > /dev/tcp/127.0.0.1/3306) >/dev/null 2>&1 && { echo "Proxy is up."; break; }
+            sleep 1
+          done
+
+      - name: Create per-run database and grant it to the IAM user
+        env:
+          SA_EMAIL: ${{ vars.GCP_CI_SA_EMAIL }}
+        run: |
+          # A freshly-created Cloud SQL IAM database user can authenticate but has
+          # no privileges on any database, so the conformance server (which creates
+          # the coordination tables) would fail with "Access denied ... to database".
+          #
+          # The grant must run as a privileged user, but the --auto-iam-authn proxy
+          # forces IAM auth on every connection and the IAM user cannot grant to
+          # itself. The instance's root@% user is unprivileged here, but a built-in
+          # user created via the Admin API is automatically granted the
+          # cloudsqlsuperuser role (and Cloud SQL activates roles on login). So
+          # create an ephemeral admin user (keyless, via the SA's cloudsql.admin
+          # role) and, through a second plain proxy, have it CREATE the database and
+          # GRANT it to the IAM user.
+          MYSQL_USER="${SA_EMAIL%%@*}"
+          ADMIN_USER="ci-admin"
+          ADMIN_PW="$(openssl rand -hex 24)"
+          gcloud sql users create "${ADMIN_USER}" --host=% \
+            --instance=tessera-ci-mysql --password="${ADMIN_PW}" 2>/dev/null \
+            || gcloud sql users set-password "${ADMIN_USER}" --host=% \
+                 --instance=tessera-ci-mysql --password="${ADMIN_PW}"
+
+          ./cloud-sql-proxy --port 3307 "${{ vars.GCP_SQL_CONNECTION }}" \
+            >"${{ runner.temp }}/cloud-sql-proxy-admin.log" 2>&1 &
+          ADMIN_PROXY_PID=$!
+          for i in $(seq 1 30); do
+            (echo > /dev/tcp/127.0.0.1/3307) >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+          if ! command -v mysql >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq mysql-client
+          fi
+          # SHOW GRANTS is printed for diagnostics if anything below fails.
+          MYSQL_PWD="${ADMIN_PW}" mysql --protocol=TCP -h 127.0.0.1 -P 3307 -u "${ADMIN_USER}" -e "
+            SELECT CURRENT_USER();
+            SHOW GRANTS FOR CURRENT_USER();
+            CREATE DATABASE IF NOT EXISTS \`${DB}\`;
+            GRANT ALL PRIVILEGES ON \`${DB}\`.* TO '${MYSQL_USER}'@'%';
+            FLUSH PRIVILEGES;"
+          echo "Created ${DB} and granted ALL on it to '${MYSQL_USER}'@'%'."
+
+          kill "${ADMIN_PROXY_PID}" 2>/dev/null || true
+
+      - name: Generate ephemeral log keys
+        run: |
+          go run github.com/transparency-dev/serverless-log/cmd/generate_keys@80334bc9dc573e8f6c5b3694efad6358da50abd4 \
+            --key_name=tessera/ci \
+            --out_priv="${{ runner.temp }}/key.sec" \
+            --out_pub="${{ runner.temp }}/key.pub"
+          echo "TESSERA_SIGNER=$(cat ${{ runner.temp }}/key.sec)" >> "$GITHUB_ENV"
+          echo "TESSERA_VERIFIER=$(cat ${{ runner.temp }}/key.pub)" >> "$GITHUB_ENV"
+
+      - name: Run conformance server (background)
+        env:
+          SA_EMAIL: ${{ vars.GCP_CI_SA_EMAIL }}
+        run: |
+          # IAM DB auth: the proxy (--auto-iam-authn) authenticates the connection
+          # using the SA's OAuth token, so the DSN carries the IAM username and no
+          # password.
+          #
+          # For Cloud SQL *MySQL*, the IAM login name of a service account is the SA
+          # email with the whole "@PROJECT.iam.gserviceaccount.com" suffix removed
+          # (i.e. the local part), e.g. tessera-ci@PROJECT.iam.gserviceaccount.com
+          # -> "tessera-ci". (This differs from Postgres, which keeps the
+          # "@PROJECT.iam" form that the GCP_SQL_IAM_USER variable holds.) See
+          # https://cloud.google.com/sql/docs/mysql/iam-logins
+          MYSQL_USER="${SA_EMAIL%%@*}"
+          MYSQL_URI="${MYSQL_USER}@tcp(127.0.0.1:3306)/${DB}?parseTime=true"
+          echo "Starting conformance server as MySQL user '${MYSQL_USER}' against bucket=${BUCKET} db=${DB}"
+          go run ./cmd/conformance/gcs \
+            --bucket="${BUCKET}" \
+            --mysql_uri="${MYSQL_URI}" \
+            --signer="${TESSERA_SIGNER}" \
+            --listen=:2024 >"${{ runner.temp }}/conformance.log" 2>&1 &
+          echo "CONFORMANCE_PID=$!" >> "$GITHUB_ENV"
+
+      - name: Wait for log to be ready
+        run: |
+          # The hammer reads the log directly from GCS, so wait until the conformance
+          # server has self-initialised and published the initial (size-0) checkpoint
+          # into the bucket. This also confirms the server came up and can write to GCS.
+          TOKEN="$(gcloud auth print-access-token)"
+          echo "Waiting for checkpoint at gs://${BUCKET}/checkpoint ..."
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer ${TOKEN}" \
+              "https://storage.googleapis.com/${BUCKET}/checkpoint")
+            if [ "$code" = "200" ]; then
+              echo "Checkpoint is available."
+              exit 0
+            fi
+            if ! kill -0 "${CONFORMANCE_PID}" 2>/dev/null; then
+              echo "Conformance server exited prematurely. Logs:"
+              cat "${{ runner.temp }}/conformance.log" || true
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "Timed out waiting for the initial checkpoint. Conformance server logs:"
+          cat "${{ runner.temp }}/conformance.log" || true
+          exit 1
+
+      - name: Run hammer
+        run: |
+          # Reads come straight from the GCS bucket (authenticated with the CI SA's
+          # access token); writes go to the conformance server's POST /add endpoint.
+          # The hammer's exit code is the pass/fail signal for this job.
+          go run ./internal/hammer \
+            --log_url="https://storage.googleapis.com/${BUCKET}/" \
+            --write_log_url="http://localhost:2024/" \
+            --log_public_key="${TESSERA_VERIFIER}" \
+            --bearer_token="$(gcloud auth print-access-token)" \
+            --num_writers=8 \
+            --max_write_ops=200 \
+            --num_readers_random=2 \
+            --num_readers_full=2 \
+            --leaf_min_size=512 \
+            --leaf_write_goal=1000 \
+            --max_runtime=5m \
+            --show_ui=false
+
+      - name: Dump server and proxy logs
+        if: always()
+        run: |
+          echo "===== conformance server log ====="
+          cat "${{ runner.temp }}/conformance.log" || true
+          echo "===== cloud-sql-proxy log ====="
+          cat "${{ runner.temp }}/cloud-sql-proxy.log" || true
+          echo "===== cloud-sql-proxy (admin) log ====="
+          cat "${{ runner.temp }}/cloud-sql-proxy-admin.log" || true
+
+      - name: Teardown per-run resources
+        if: always()
+        run: |
+          # Stop the conformance server so it releases its DB connections before the
+          # database is dropped.
+          if [ -n "${CONFORMANCE_PID}" ]; then
+            kill "${CONFORMANCE_PID}" 2>/dev/null || true
+          fi
+          # Delete the per-run bucket and database. The shared Cloud SQL instance is
+          # left untouched; the nightly ci_infra_teardown handles that.
+          if [ -n "${BUCKET}" ]; then
+            gcloud storage rm -r "gs://${BUCKET}" --quiet || true
+          fi
+          if [ -n "${DB}" ]; then
+            gcloud sql databases delete "${DB}" --instance=tessera-ci-mysql --quiet || true
+          fi
