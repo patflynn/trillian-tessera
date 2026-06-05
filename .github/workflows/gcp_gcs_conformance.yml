@@ -89,7 +89,11 @@ jobs:
           curl -fsSL -o cloud-sql-proxy \
             https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v2.14.1/cloud-sql-proxy.linux.amd64
           chmod +x cloud-sql-proxy
-          ./cloud-sql-proxy --auto-iam-authn --port 3306 "${{ vars.GCP_SQL_CONNECTION }}" &
+          # Keep the proxy's logs (it runs in the background, so redirect to a file
+          # that later steps can dump for diagnostics).
+          ./cloud-sql-proxy --auto-iam-authn --port 3306 "${{ vars.GCP_SQL_CONNECTION }}" \
+            >"${{ runner.temp }}/cloud-sql-proxy.log" 2>&1 &
+          echo "PROXY_PID=$!" >> "$GITHUB_ENV"
           echo "Waiting for Cloud SQL Auth Proxy on 127.0.0.1:3306..."
           for i in $(seq 1 30); do
             (echo > /dev/tcp/127.0.0.1/3306) >/dev/null 2>&1 && { echo "Proxy is up."; break; }
@@ -106,11 +110,22 @@ jobs:
           echo "TESSERA_VERIFIER=$(cat ${{ runner.temp }}/key.pub)" >> "$GITHUB_ENV"
 
       - name: Run conformance server (background)
+        env:
+          SA_EMAIL: ${{ vars.GCP_CI_SA_EMAIL }}
         run: |
-          # IAM DB auth: the proxy authenticates the connection, so the DSN carries
-          # the IAM username and no password.
-          MYSQL_URI="${{ vars.GCP_SQL_IAM_USER }}@tcp(127.0.0.1:3306)/${DB}?parseTime=true"
-          echo "Starting conformance server against bucket=${BUCKET} db=${DB}"
+          # IAM DB auth: the proxy (--auto-iam-authn) authenticates the connection
+          # using the SA's OAuth token, so the DSN carries the IAM username and no
+          # password.
+          #
+          # For Cloud SQL *MySQL*, the IAM login name of a service account is the SA
+          # email with the whole "@PROJECT.iam.gserviceaccount.com" suffix removed
+          # (i.e. the local part), e.g. tessera-ci@PROJECT.iam.gserviceaccount.com
+          # -> "tessera-ci". (This differs from Postgres, which keeps the
+          # "@PROJECT.iam" form that the GCP_SQL_IAM_USER variable holds.) See
+          # https://cloud.google.com/sql/docs/mysql/iam-logins
+          MYSQL_USER="${SA_EMAIL%%@*}"
+          MYSQL_URI="${MYSQL_USER}@tcp(127.0.0.1:3306)/${DB}?parseTime=true"
+          echo "Starting conformance server as MySQL user '${MYSQL_USER}' against bucket=${BUCKET} db=${DB}"
           go run ./cmd/conformance/gcs \
             --bucket="${BUCKET}" \
             --mysql_uri="${MYSQL_URI}" \
@@ -163,9 +178,13 @@ jobs:
             --max_runtime=5m \
             --show_ui=false
 
-      - name: Dump conformance server logs
+      - name: Dump server and proxy logs
         if: always()
-        run: cat "${{ runner.temp }}/conformance.log" || true
+        run: |
+          echo "===== conformance server log ====="
+          cat "${{ runner.temp }}/conformance.log" || true
+          echo "===== cloud-sql-proxy log ====="
+          cat "${{ runner.temp }}/cloud-sql-proxy.log" || true
 
       - name: Teardown per-run resources
         if: always()
