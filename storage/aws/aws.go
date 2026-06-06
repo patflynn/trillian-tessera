@@ -156,6 +156,11 @@ const (
 	// (cloud.google.com/go/storage), authenticating with Application Default
 	// Credentials / Workload Identity. See gcs.go.
 	ObjectStoreGCS
+	// ObjectStoreBlob uses the portable Go CDK blob abstraction
+	// (gocloud.dev/blob), selecting the provider (GCS, S3/MinIO/Ceph/R2, local
+	// filesystem, in-memory) from Config.BlobURL. Authentication is each
+	// driver's native credential chain. See blob.go.
+	ObjectStoreBlob
 )
 
 // Config holds AWS project and resource configuration for a storage instance.
@@ -168,6 +173,11 @@ type Config struct {
 	// point the client at a fake GCS server. If unset, the client uses
 	// Application Default Credentials / Workload Identity.
 	GCSOptions []option.ClientOption
+	// BlobURL is the provider-scoped bucket URL used when ObjectStore is
+	// ObjectStoreBlob, e.g. "gs://my-bucket", "s3://my-bucket?endpoint=...",
+	// "file:///var/lib/tessera" or "mem://". The URL selects both the Go CDK
+	// blob driver and the bucket; authentication is the driver's native chain.
+	BlobURL string
 	// SDKConfig is an optional AWS config to use when configuring service clients, e.g. to
 	// use non-AWS S3 or MySQL services.
 	//
@@ -230,11 +240,14 @@ func New(ctx context.Context, cfg Config) (tessera.Driver, error) {
 //
 // By default this builds the S3-backed s3Storage, leaving the AWS code path
 // unchanged. When Config.ObjectStore is ObjectStoreGCS, it builds a native
-// GCS-backed gcsStore instead.
+// GCS-backed gcsStore; when ObjectStoreBlob, it builds a portable
+// gocloud.dev/blob-backed blobStore selected by Config.BlobURL.
 func (s *Storage) newObjStore(ctx context.Context) (objStore, error) {
 	switch s.cfg.ObjectStore {
 	case ObjectStoreGCS:
 		return newGCSStore(ctx, s.cfg.Bucket, s.cfg.BucketPrefix, s.cfg.GCSOptions...)
+	case ObjectStoreBlob:
+		return newBlobStore(ctx, s.cfg.BlobURL, s.cfg.BucketPrefix)
 	default:
 		return &s3Storage{
 			s3Client:     s3.NewFromConfig(*s.cfg.SDKConfig, s.cfg.S3Options),
