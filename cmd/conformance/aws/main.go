@@ -50,6 +50,9 @@ var (
 	s3AccessKeyID     = flag.String("s3_access_key", "", "Access key ID for custom non-AWS S3 service")
 	s3SecretAccessKey = flag.String("s3_secret", "", "Secret access key for custom non-AWS S3 service")
 
+	objectStore = flag.String("object_store", "s3", "Object store backend to use: \"s3\" (default, AWS SDK) or \"blob\" (portable gocloud.dev/blob).")
+	blobURL     = flag.String("blob_url", "", "Provider-scoped bucket URL for --object_store=blob, e.g. gs://BUCKET, s3://BUCKET?endpoint=...&s3ForcePathStyle=true&region=..., file:///path, mem://. Auth is each driver's native credential chain.")
+
 	listen            = flag.String("listen", ":2024", "Address:port to listen on")
 	signer            = flag.String("signer", "", "Note signer to use to sign checkpoints")
 	publishInterval   = flag.Duration("publish_interval", 3*time.Second, "How frequently to publish updated checkpoints")
@@ -163,7 +166,9 @@ func main() {
 // provided via flags.
 func storageConfigFromFlags() aws.Config {
 	ctx := context.Background()
-	if *bucket == "" {
+	// The portable blob object store encodes the bucket in --blob_url, so
+	// --bucket is not required in that mode.
+	if *objectStore != "blob" && *bucket == "" {
 		slog.ErrorContext(ctx, "--bucket must be set")
 		os.Exit(1)
 	}
@@ -216,7 +221,7 @@ func storageConfigFromFlags() aws.Config {
 		}
 	}
 
-	return aws.Config{
+	cfg := aws.Config{
 		Bucket:       *bucket,
 		SDKConfig:    awsConfig,
 		S3Options:    s3Opts,
@@ -224,6 +229,19 @@ func storageConfigFromFlags() aws.Config {
 		MaxOpenConns: *dbMaxConns,
 		MaxIdleConns: *dbMaxIdle,
 	}
+
+	// Optionally route object storage through the portable gocloud.dev/blob
+	// backend. The S3 path above remains the default and is unchanged.
+	if *objectStore == "blob" {
+		if *blobURL == "" {
+			slog.ErrorContext(ctx, "--blob_url must be set when --object_store=blob")
+			os.Exit(1)
+		}
+		cfg.ObjectStore = aws.ObjectStoreBlob
+		cfg.BlobURL = *blobURL
+	}
+
+	return cfg
 }
 
 func antispamMysqlConfig() *mysql.Config {
