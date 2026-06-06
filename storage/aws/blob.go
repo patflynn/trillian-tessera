@@ -148,7 +148,7 @@ func (s *blobStore) setObjectIfNoneMatch(ctx context.Context, objName string, da
 		if gcerrors.Code(err) == gcerrors.FailedPrecondition {
 			existing, gErr := s.getObject(ctx, objName)
 			if gErr != nil {
-				return fmt.Errorf("failed to fetch existing content for %q: %v", name, gErr)
+				return fmt.Errorf("failed to fetch existing content for %q: %w", name, gErr)
 			}
 			if !bytes.Equal(existing, data) {
 				slog.ErrorContext(ctx, "Resource non-idempotent write", slog.String("objname", name), slog.String("diff", cmp.Diff(existing, data)))
@@ -180,11 +180,11 @@ func (s *blobStore) deleteObjectsWithPrefix(ctx context.Context, objPrefix strin
 				break
 			}
 			if err != nil {
-				return fmt.Errorf("failed to list objects with prefix %q: %v", prefix, err)
+				return fmt.Errorf("failed to list objects with prefix %q: %w", prefix, err)
 			}
 			slog.DebugContext(ctx, "Deleting object", slog.String("key", obj.Key))
 			if err := s.bucket.Delete(ctx, obj.Key); err != nil {
-				return fmt.Errorf("failed to delete object %q: %v", obj.Key, err)
+				return fmt.Errorf("failed to delete object %q: %w", obj.Key, err)
 			}
 		}
 		return nil

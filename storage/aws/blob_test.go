@@ -20,6 +20,7 @@ import (
 	"errors"
 	"io"
 	"net/url"
+	"slices"
 	"sort"
 	"testing"
 
@@ -177,7 +178,7 @@ func TestBlobBucketPrefix(t *testing.T) {
 			// The object must physically live under the bucket prefix.
 			names := objectNamesInBlobBucket(t, s)
 			want := []string{"logs/my-log/tile/0/000"}
-			if !equalStringSlices(names, want) {
+			if !slices.Equal(names, want) {
 				t.Errorf("stored object names = %v, want %v", names, want)
 			}
 
