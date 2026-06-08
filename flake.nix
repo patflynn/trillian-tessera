@@ -20,6 +20,7 @@
             pkgs.gh               # GitHub CLI (repo vars, workflows, branch protection)
             pkgs.opentofu         # `tofu` — open-source (MPL) Terraform drop-in; terraform itself is unfree (BSL) in nixpkgs
             pkgs.terragrunt       # thin wrapper over tofu for the CI infra stacks
+            pkgs.golangci-lint    # Go linter — matches the `lint` CI job; run locally before pushing (uses the system Go toolchain)
           ];
           # Point Terragrunt at OpenTofu instead of the (unfree, absent) terraform binary.
           TERRAGRUNT_TFPATH = "${pkgs.opentofu}/bin/tofu";
