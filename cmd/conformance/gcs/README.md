@@ -1,14 +1,14 @@
 # Conformance testing binary for GCS + MySQL
 
-This binary is a conformance/compliance/performance personality for the
-**native Google Cloud Storage object store with MySQL coordination**.
+This binary is a conformance/compliance/performance personality for
+**Google Cloud Storage with MySQL coordination**.
 
 It reuses the `storage/aws` backend's MySQL sequencing/integration code unchanged
-and selects the native-GCS object store (`storage/aws/gcs.go`) via
-`aws.Config{ObjectStore: aws.ObjectStoreGCS}`. In other words it is identical to
-[`cmd/conformance/aws`](../aws/) except the object store is GCS (via the native
-`cloud.google.com/go/storage` client) instead of S3. See
-[the design doc](/docs/design/cloud-agnostic-storage.md) for the rationale.
+and selects GCS through the portable gocloud.dev/blob object store
+(`storage/aws/blob.go`) via `aws.Config{BlobURL: "gs://BUCKET"}`. In other words
+it is identical to [`cmd/conformance/aws`](../aws/) except the object store is
+selected with a `gs://` bucket URL (gcsblob driver) instead of an `s3://` one.
+See [the design doc](/docs/design/cloud-agnostic-storage.md) for the rationale.
 
 Like the other conformance personalities, it exposes a `POST /add` endpoint that
 appends the request body to the log and returns the assigned index. Reads are

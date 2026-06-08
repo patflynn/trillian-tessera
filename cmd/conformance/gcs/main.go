@@ -13,13 +13,13 @@
 // limitations under the License.
 
 // gcs is a simple personality allowing to run conformance/compliance/performance
-// tests against the native Google Cloud Storage object store backed by MySQL
-// coordination.
+// tests against Google Cloud Storage backed by MySQL coordination.
 //
 // It is modelled closely on cmd/conformance/aws: write coordination is handled by
 // MySQL exactly as the AWS backend does (same sequencer/integration schema); the
-// only difference is the object store is GCS (via the native GCS client) rather
-// than S3. The GCS client authenticates using Application Default Credentials /
+// only difference is the object store is selected with a gs:// bucket URL rather
+// than an s3:// one. Both run through the same portable gocloud.dev/blob object
+// store. The gcsblob driver authenticates using Application Default Credentials /
 // Workload Identity, so no static keys are required.
 package main
 
@@ -80,8 +80,8 @@ func main() {
 
 	s, a := signerFromFlags()
 
-	// Create our Tessera storage backend, selecting the native GCS object store
-	// while keeping MySQL coordination (identical to the AWS backend).
+	// Create our Tessera storage backend, selecting GCS via the portable blob
+	// object store while keeping MySQL coordination (identical to the AWS backend).
 	cfg := storageConfigFromFlags()
 	driver, err := aws.New(ctx, cfg)
 	if err != nil {
@@ -171,10 +171,10 @@ func storageConfigFromFlags() aws.Config {
 	}
 
 	return aws.Config{
-		// Select the native-GCS object store (gcsStore). The GCS client resolves
-		// credentials via ADC / Workload Identity, so no keys are configured here.
-		ObjectStore:  aws.ObjectStoreGCS,
-		Bucket:       *bucket,
+		// Select GCS via the portable gocloud.dev/blob object store. The gcsblob
+		// driver resolves credentials via ADC / Workload Identity, so no keys are
+		// configured here.
+		BlobURL:      "gs://" + *bucket,
 		BucketPrefix: *bucketPrefix,
 		// Coordination is plain MySQL, exactly as in the AWS backend.
 		DSN:          *mysqlURI,
