@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"slices"
 	"sort"
 	"testing"
 
@@ -158,7 +159,7 @@ func TestGCSBucketPrefix(t *testing.T) {
 	// The object must physically live under the bucket prefix.
 	names := objectNamesInBucket(t, s, prefix)
 	want := []string{"logs/my-log/tile/0/000"}
-	if !equalStringSlices(names, want) {
+	if !slices.Equal(names, want) {
 		t.Errorf("stored object names = %v, want %v", names, want)
 	}
 
@@ -193,16 +194,4 @@ func objectNamesInBucket(t *testing.T, s *gcsStore, prefix string) []string {
 	}
 	sort.Strings(names)
 	return names
-}
-
-func equalStringSlices(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
