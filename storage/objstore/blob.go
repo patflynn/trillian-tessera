@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package aws
+package objstore
 
 // This file provides a portable, provider-agnostic implementation of the
-// objStore interface (see aws.go) backed by the Go CDK blob abstraction
+// objStore interface (see objstore.go) backed by the Go CDK blob abstraction
 // (gocloud.dev/blob). A single blobStore can serve object storage from GCS, any
 // S3-compatible store (AWS S3, MinIO, Ceph/RGW, Cloudflare R2), the local
 // filesystem, or an in-memory bucket, selected purely by the bucket URL.
@@ -167,7 +167,7 @@ func (s *blobStore) setObjectIfNoneMatch(ctx context.Context, objName string, da
 // Objects are listed via the blob iterator and removed individually, sidestepping
 // any provider-specific batch-delete semantics.
 func (s *blobStore) deleteObjectsWithPrefix(ctx context.Context, objPrefix string) error {
-	return otel.TraceErr(ctx, "tessera.storage.aws.deleteObject", tracer, func(ctx context.Context, span trace.Span) error {
+	return otel.TraceErr(ctx, "tessera.storage.objstore.deleteObject", tracer, func(ctx context.Context, span trace.Span) error {
 		prefix := s.objectName(objPrefix)
 		span.SetAttributes(objectPathKey.String(prefix))
 

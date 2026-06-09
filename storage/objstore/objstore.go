@@ -12,9 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package aws contains a MySQL-coordinated storage implementation for Tessera.
-//
-// TODO: decide whether to rename this package.
+// Package objstore contains a MySQL-coordinated storage implementation for Tessera.
 //
 // This storage implementation uses a single object-storage bucket for long-term
 // storage and serving of entry bundles and log tiles, and MySQL for coordinating
@@ -31,7 +29,7 @@
 //
 // A MySQL database provides a transactional mechanism to allow multiple
 // frontends to safely update the contents of the log.
-package aws
+package objstore
 
 import (
 	"bytes"
@@ -94,7 +92,7 @@ const (
 	defaultGCTimeout = 30 * time.Second
 )
 
-// Storage is an AWS based storage implementation for Tessera.
+// Storage is an object-store based storage implementation for Tessera.
 type Storage struct {
 	cfg Config
 }
@@ -164,7 +162,7 @@ type Config struct {
 	HTTPClient *http.Client
 }
 
-// New creates a new instance of the AWS based Storage.
+// New creates a new instance of the object-store based Storage.
 //
 // Storage instances created via this c'tor will participate in integrating newly sequenced entries into the log
 // and periodically publishing a new checkpoint which commits to the state of the tree.
@@ -292,7 +290,7 @@ func (a *Appender) integrateEntriesJob(ctx context.Context) {
 		case <-t.C:
 		}
 
-		if err := otel.TraceErr(ctx, "tessera.storage.aws.integrateEntriesJob", tracer, func(ctx context.Context, span trace.Span) error {
+		if err := otel.TraceErr(ctx, "tessera.storage.objstore.integrateEntriesJob", tracer, func(ctx context.Context, span trace.Span) error {
 			start := time.Now()
 			defer func() {
 				opsHistogram.Record(ctx, time.Since(start).Milliseconds(), metric.WithAttributes(opNameKey.String("integrateEntries")))
@@ -329,7 +327,7 @@ func (a *Appender) publishCheckpointJob(ctx context.Context, pubInterval, republ
 		case <-a.treeUpdated:
 		case <-t.C:
 		}
-		if err := otel.TraceErr(ctx, "tessera.storage.aws.publishCheckpointJob", tracer, func(ctx context.Context, span trace.Span) error {
+		if err := otel.TraceErr(ctx, "tessera.storage.objstore.publishCheckpointJob", tracer, func(ctx context.Context, span trace.Span) error {
 			ctx, cancel := context.WithTimeout(ctx, defaultPublicationTimeout)
 			defer cancel() // Note: ok because we're in a func passed to TraceErr here!
 
@@ -363,7 +361,7 @@ func (a *Appender) garbageCollectorJob(ctx context.Context, i time.Duration) {
 			return
 		case <-t.C:
 		}
-		if err := otel.TraceErr(ctx, "tessera.storage.aws.garbageCollectJob", tracer, func(ctx context.Context, span trace.Span) error {
+		if err := otel.TraceErr(ctx, "tessera.storage.objstore.garbageCollectJob", tracer, func(ctx context.Context, span trace.Span) error {
 			ctx, cancel := context.WithTimeout(ctx, defaultGCTimeout)
 			defer cancel() // Note: ok because we're in a func passed to TraceErr here!
 
@@ -532,7 +530,7 @@ func (a *Appender) updateEntryBundles(ctx context.Context, fromSeq uint64, entri
 	return seqErr.Wait()
 }
 
-// MigrationWriter creates a new AWS storage for the MigrationWriter lifecycle mode.
+// MigrationWriter creates a new object-store storage for the MigrationWriter lifecycle mode.
 func (s *Storage) MigrationWriter(ctx context.Context, opts *tessera.MigrationOptions) (migrate.MigrationWriter, tessera.LogReader, error) {
 	oStore, err := s.newObjStore(ctx)
 	if err != nil {

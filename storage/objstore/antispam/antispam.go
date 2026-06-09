@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package aws contains an AWS-based antispam implementation for Tessera.
+// Package antispam contains a MySQL-coordinated antispam implementation for Tessera.
 //
 // A MySQL database provides a mechanism for maintaining an index of
 // hash --> log position for detecting duplicate submissions.
-package aws
+package antispam
 
 import (
 	"context"
@@ -252,7 +252,7 @@ type follower struct {
 }
 
 func (f *follower) Name() string {
-	return "AWS antispam"
+	return "MySQL antispam"
 }
 
 // Follow uses entry data from the log to populate the antispam storage.
@@ -282,7 +282,7 @@ func (f *follower) Follow(ctx context.Context, lr tessera.LogReader) {
 				return
 			default:
 			}
-			err := otel.TraceErr(ctx, "tessera.antispam.aws.FollowTask", tracer, func(ctx context.Context, span trace.Span) error {
+			err := otel.TraceErr(ctx, "tessera.antispam.objstore.FollowTask", tracer, func(ctx context.Context, span trace.Span) error {
 				ctx, cancel := context.WithTimeout(ctx, defaultBatchTimeout)
 				defer cancel()
 

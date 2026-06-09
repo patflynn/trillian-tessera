@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// aws-migrate is a command-line tool for migrating data from a tlog-tiles
-// compliant log, into a Tessera log instance hosted on AWS.
+// s3-migrate is a command-line tool for migrating data from a tlog-tiles
+// compliant log into a Tessera log instance backed by an S3-compatible object store.
 package main
 
 import (
@@ -29,7 +29,7 @@ import (
 	"github.com/transparency-dev/tessera"
 	"github.com/transparency-dev/tessera/client"
 	"github.com/transparency-dev/tessera/internal/parse"
-	"github.com/transparency-dev/tessera/storage/aws"
+	"github.com/transparency-dev/tessera/storage/objstore"
 )
 
 var (
@@ -82,10 +82,10 @@ func main() {
 	}
 
 	// Create our Tessera storage backend:
-	awsCfg := storageConfigFromFlags()
-	driver, err := aws.New(ctx, awsCfg)
+	cfg := storageConfigFromFlags()
+	driver, err := objstore.New(ctx, cfg)
 	if err != nil {
-		slog.ErrorContext(ctx, "Failed to create new AWS storage", slog.Any("error", err))
+		slog.ErrorContext(ctx, "Failed to create new storage", slog.Any("error", err))
 		os.Exit(1)
 	}
 	opts := tessera.NewMigrationOptions()
@@ -103,9 +103,9 @@ func main() {
 	}
 }
 
-// storageConfigFromFlags returns an aws.Config struct populated with values
+// storageConfigFromFlags returns an objstore.Config struct populated with values
 // provided via flags.
-func storageConfigFromFlags() aws.Config {
+func storageConfigFromFlags() objstore.Config {
 	if *bucket == "" {
 		slog.ErrorContext(context.Background(), "--bucket must be set")
 		os.Exit(1)
@@ -142,7 +142,7 @@ func storageConfigFromFlags() aws.Config {
 		AllowNativePasswords:    true,
 	}
 
-	return aws.Config{
+	return objstore.Config{
 		BlobURL:      blobURLFromFlags(context.Background()),
 		DSN:          c.FormatDSN(),
 		MaxOpenConns: *dbMaxConns,

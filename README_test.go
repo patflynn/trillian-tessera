@@ -36,7 +36,7 @@ import (
 
 	// Choose one!
 	"github.com/transparency-dev/tessera/storage/posix"
-	// "github.com/transparency-dev/tessera/storage/aws"
+	// "github.com/transparency-dev/tessera/storage/objstore"
 	// "github.com/transparency-dev/tessera/storage/gcp"
 	// "github.com/transparency-dev/tessera/storage/mysql"
 
