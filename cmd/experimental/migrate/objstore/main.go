@@ -12,8 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// s3-migrate is a command-line tool for migrating data from a tlog-tiles
-// compliant log into a Tessera log instance backed by an S3-compatible object store.
+// objstore-migrate is a command-line tool for migrating data from a tlog-tiles
+// compliant log into a Tessera log instance backed by any gocloud.dev/blob
+// object store (GCS, AWS S3 or other S3-compatible stores) coordinated by MySQL.
+//
+// The object store is selected with a single provider-scoped bucket URL passed
+// via --blob_url (e.g. gs://BUCKET, s3://BUCKET?endpoint=...&region=...,
+// file:///path). For convenience, when --blob_url is unset an s3:// URL is
+// derived from --bucket and the --s3_endpoint/--s3_access_key/--s3_secret flags.
 package main
 
 import (
@@ -28,12 +34,22 @@ import (
 	"github.com/go-sql-driver/mysql"
 	"github.com/transparency-dev/tessera"
 	"github.com/transparency-dev/tessera/client"
+	"github.com/transparency-dev/tessera/cmd/internal/bloburl"
 	"github.com/transparency-dev/tessera/internal/parse"
 	"github.com/transparency-dev/tessera/storage/objstore"
+	"gocloud.dev/blob"
+
+	// Register the blob drivers this binary supports. Each registers itself
+	// for its URL scheme (gs://, s3://, file://) on import; the
+	// storage/objstore library itself is driver-agnostic.
+	_ "gocloud.dev/blob/fileblob"
+	_ "gocloud.dev/blob/gcsblob"
+	_ "gocloud.dev/blob/s3blob"
 )
 
 var (
 	bucket            = flag.String("bucket", "", "Bucket to use for storing log")
+	blobURL           = flag.String("blob_url", "", "Optional explicit provider-scoped bucket URL for the object store, e.g. gs://BUCKET, s3://BUCKET?endpoint=...&s3ForcePathStyle=true&region=..., file:///path. If unset, a URL is derived from --bucket and the --s3_* flags. Auth is each driver's native credential chain.")
 	dbName            = flag.String("db_name", "", "AuroraDB name")
 	dbHost            = flag.String("db_host", "", "AuroraDB host")
 	dbPort            = flag.Int("db_port", 3306, "AuroraDB port")
@@ -82,7 +98,12 @@ func main() {
 	}
 
 	// Create our Tessera storage backend:
-	cfg := storageConfigFromFlags()
+	cfg := storageConfigFromFlags(ctx)
+	defer func() {
+		if err := cfg.Bucket.Close(); err != nil {
+			slog.WarnContext(ctx, "Failed to close blob bucket", slog.Any("error", err))
+		}
+	}()
 	driver, err := objstore.New(ctx, cfg)
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to create new storage", slog.Any("error", err))
@@ -105,9 +126,12 @@ func main() {
 
 // storageConfigFromFlags returns an objstore.Config struct populated with values
 // provided via flags.
-func storageConfigFromFlags() objstore.Config {
-	if *bucket == "" {
-		slog.ErrorContext(context.Background(), "--bucket must be set")
+//
+// The returned Config holds an open *blob.Bucket which the caller must Close
+// once the migration is complete.
+func storageConfigFromFlags(ctx context.Context) objstore.Config {
+	if *blobURL == "" && *bucket == "" {
+		slog.ErrorContext(ctx, "either --bucket or --blob_url must be set")
 		os.Exit(1)
 	}
 	if *dbName == "" {
@@ -142,53 +166,37 @@ func storageConfigFromFlags() objstore.Config {
 		AllowNativePasswords:    true,
 	}
 
+	u := blobURLFromFlags(ctx)
+	bkt, err := blob.OpenBucket(ctx, u)
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to open blob bucket", slog.String("url", u), slog.Any("error", err))
+		os.Exit(1)
+	}
+
 	return objstore.Config{
-		BlobURL:      blobURLFromFlags(context.Background()),
+		Bucket:       bkt,
 		DSN:          c.FormatDSN(),
 		MaxOpenConns: *dbMaxConns,
 		MaxIdleConns: *dbMaxIdle,
 	}
 }
 
-// blobURLFromFlags derives the gocloud.dev/blob bucket URL for the object store
-// from --bucket and the --s3_* flags.
+// blobURLFromFlags derives the gocloud.dev/blob bucket URL for the object store.
 //
-// With a custom --s3_endpoint (e.g. MinIO), the endpoint, region and path-style
-// addressing are encoded as query parameters, and the static --s3_access_key /
-// --s3_secret credentials are exported into the AWS SDK credential chain (via
-// environment variables) so the s3blob driver picks them up. Without
-// --s3_endpoint (real AWS), a plain s3://BUCKET URL is used and the region and
-// credentials are resolved by the AWS SDK's default chain.
+// If --blob_url is set it is used verbatim (allowing gs://, file://, or a
+// fully-specified s3:// URL). Otherwise an s3:// URL is built from --bucket and
+// the --s3_* flags via bloburl.DeriveS3, which also exports any static
+// --s3_access_key / --s3_secret credentials into the AWS SDK chain for the
+// s3blob driver.
 func blobURLFromFlags(ctx context.Context) string {
-	if *s3Endpoint == "" {
-		return "s3://" + *bucket
+	if *blobURL != "" {
+		return *blobURL
 	}
 
-	// Only set the credential vars when the corresponding flags are non-empty
-	// so we don't clobber any ambient AWS credentials, and only default
-	// AWS_REGION when it isn't already configured.
-	const defaultRegion = "us-east-1"
-	envVars := make(map[string]string)
-	if *s3AccessKeyID != "" {
-		envVars["AWS_ACCESS_KEY_ID"] = *s3AccessKeyID
+	u, err := bloburl.DeriveS3(*bucket, *s3Endpoint, *s3AccessKeyID, *s3SecretAccessKey)
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to derive blob URL from --bucket/--s3_* flags", slog.Any("error", err))
+		os.Exit(1)
 	}
-	if *s3SecretAccessKey != "" {
-		envVars["AWS_SECRET_ACCESS_KEY"] = *s3SecretAccessKey
-	}
-	if _, ok := os.LookupEnv("AWS_REGION"); !ok {
-		envVars["AWS_REGION"] = defaultRegion
-	}
-	for k, v := range envVars {
-		if err := os.Setenv(k, v); err != nil {
-			slog.ErrorContext(ctx, "failed to set AWS credential env var", slog.String("var", k), slog.Any("error", err))
-			os.Exit(1)
-		}
-	}
-
-	q := url.Values{
-		"endpoint":         {*s3Endpoint},
-		"s3ForcePathStyle": {"true"},
-		"region":           {defaultRegion},
-	}
-	return "s3://" + *bucket + "?" + q.Encode()
+	return u
 }

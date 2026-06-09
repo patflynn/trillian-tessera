@@ -8,6 +8,13 @@ Ship a **native-GCS-client** implementation first (GCS is required short-term), 
 single `gocloud.dev/blob`-backed implementation for true run-anywhere. Firestore-native backend
 deferred (plan preserved on the `firestore-plan` branch).
 
+**Implemented (2026-06-09):** Option B landed directly — `storage/objstore` ships a single
+`gocloud.dev/blob`-backed `objStore` (see `blob.go`), skipping the interim native-GCS-client step.
+`Config` takes an already-opened `*blob.Bucket` rather than a URL, so driver selection (and the
+provider SDKs compiled in) belongs to the application: the binaries in `/cmd` blank-import the
+drivers they support and derive bucket URLs via `cmd/internal/bloburl`. Not-found is signalled by
+wrapping `os.ErrNotExist`, removing the AWS error types from the portable layer.
+
 > **Rev 2 changes the core mechanism.** Rev 1 proposed pointing the AWS S3 client at GCS via
 > S3-interoperability and translating headers + auth. Investigation showed that path is the
 > *worst-of-both-worlds*: it's a configuration nobody runs in production **and** the one that needs

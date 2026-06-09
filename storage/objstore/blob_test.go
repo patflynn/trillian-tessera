@@ -19,13 +19,17 @@ import (
 	"context"
 	"errors"
 	"io"
-	"net/url"
+	"os"
 	"slices"
 	"sort"
 	"testing"
 
-	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"gocloud.dev/blob"
+
+	// The library deliberately registers no blob drivers; tests, like
+	// applications, import the drivers they want to use.
+	_ "gocloud.dev/blob/fileblob"
+	_ "gocloud.dev/blob/memblob"
 )
 
 // blobURLs returns the set of in-process blob driver URLs to exercise. Both
@@ -40,16 +44,16 @@ func blobURLs(t *testing.T) map[string]string {
 	}
 }
 
-// newTestBlobStore opens a blobStore against the given driver URL via
-// newBlobStore (exercising the URL-based construction path).
+// newTestBlobStore opens a bucket for the given driver URL, as an application
+// would, and wraps it in a blobStore.
 func newTestBlobStore(t *testing.T, rawURL, bucketPrefix string) *blobStore {
 	t.Helper()
-	s, err := newBlobStore(context.Background(), rawURL, bucketPrefix)
+	b, err := blob.OpenBucket(context.Background(), rawURL)
 	if err != nil {
-		t.Fatalf("newBlobStore(%q): %v", rawURL, err)
+		t.Fatalf("blob.OpenBucket(%q): %v", rawURL, err)
 	}
-	t.Cleanup(func() { _ = s.bucket.Close() })
-	return s
+	t.Cleanup(func() { _ = b.Close() })
+	return newBlobStore(b, bucketPrefix)
 }
 
 func TestBlobGetObjectRoundtrip(t *testing.T) {
@@ -84,11 +88,10 @@ func TestBlobGetObjectNotFound(t *testing.T) {
 			if err == nil {
 				t.Fatalf("getObject of missing key returned nil error, want not-found")
 			}
-			// Callers detect "not found" via errors.As against *types.NoSuchKey,
-			// so the blob implementation must mirror that shape.
-			var nske *types.NoSuchKey
-			if !errors.As(err, &nske) {
-				t.Errorf("getObject error = %v, want one wrapping *types.NoSuchKey", err)
+			// Callers detect "not found" via errors.Is against os.ErrNotExist,
+			// so the blob implementation must wrap that sentinel.
+			if !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("getObject error = %v, want one wrapping os.ErrNotExist", err)
 			}
 		})
 	}
@@ -193,28 +196,6 @@ func TestBlobBucketPrefix(t *testing.T) {
 				t.Errorf("object still present after prefix delete")
 			}
 		})
-	}
-}
-
-// TestBlobOpenBucketParsesS3URL is a lightweight, hermetic check that an
-// S3-style URL (the on-prem / MinIO / R2 path) parses and opens without
-// contacting any network. It exercises the s3blob driver registration and URL
-// option handling without requiring credentials or a live endpoint.
-func TestBlobOpenBucketParsesS3URL(t *testing.T) {
-	ctx := context.Background()
-	// A syntactically valid S3 URL with a custom endpoint. Opening only
-	// constructs the client; no request is made until an object is accessed.
-	rawURL := "s3://example-bucket?" + url.Values{
-		"endpoint":         {"http://127.0.0.1:9000"},
-		"region":           {"us-east-1"},
-		"s3ForcePathStyle": {"true"},
-	}.Encode()
-	s, err := newBlobStore(ctx, rawURL, "")
-	if err != nil {
-		t.Fatalf("newBlobStore(%q): %v", rawURL, err)
-	}
-	if err := s.bucket.Close(); err != nil {
-		t.Errorf("bucket.Close: %v", err)
 	}
 }
 

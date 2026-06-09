@@ -38,8 +38,6 @@ import (
 
 	"log/slog"
 
-	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/aws/smithy-go"
 	"github.com/google/go-cmp/cmp"
 	"github.com/transparency-dev/merkle/rfc6962"
 	"github.com/transparency-dev/tessera"
@@ -756,7 +754,7 @@ func (m *memObjStore) getObject(_ context.Context, obj string) ([]byte, error) {
 
 	d, ok := m.mem[obj]
 	if !ok {
-		return nil, fmt.Errorf("obj %q not found: %w", obj, &types.NoSuchKey{})
+		return nil, fmt.Errorf("obj %q not found: %w", obj, os.ErrNotExist)
 	}
 	return d, nil
 }
@@ -786,7 +784,7 @@ func (m *memObjStore) setObjectIfNoneMatch(_ context.Context, obj string, data [
 
 	d, ok := m.mem[obj]
 	if ok && !bytes.Equal(d, data) {
-		return &smithy.GenericAPIError{Code: "PreconditionFailed"}
+		return fmt.Errorf("precondition failed: object %q already exists with different content", obj)
 	}
 	m.mem[obj] = data
 	return nil
