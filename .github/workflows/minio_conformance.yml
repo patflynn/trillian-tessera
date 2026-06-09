@@ -42,6 +42,12 @@ env:
 jobs:
   minio-conformance:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # ./cmd/conformance/aws is the unmodified pre-refactor personality built on the
+        # deprecated storage/aws wrapper; running it here proves wrapper compatibility.
+        binary: ['./cmd/conformance/objstore', './cmd/conformance/aws']
 
     # MySQL 8 coordination DB as a service container. MYSQL_DATABASE creates the
     # coordination database on first boot, so the conformance server can create
@@ -127,7 +133,7 @@ jobs:
           # requires, and export the static credentials into the AWS SDK chain for
           # the s3blob driver. Coordination uses MySQL via the --db_* flags.
           echo "Starting conformance server against MinIO bucket=${BUCKET} db=${DB}"
-          go run ./cmd/conformance/objstore \
+          go run ${{ matrix.binary }} \
             --s3_endpoint="http://localhost:9000" \
             --s3_access_key="${MINIO_ROOT_USER}" \
             --s3_secret="${MINIO_ROOT_PASSWORD}" \

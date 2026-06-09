@@ -12,18 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// objstore is a generic personality for running conformance/compliance/performance
-// tests against any gocloud.dev/blob object store backed by MySQL coordination.
-//
-// The object store is selected with a single provider-scoped bucket URL passed via
-// --blob_url (e.g. gs://BUCKET, s3://BUCKET?endpoint=...&region=..., file:///path,
-// mem://). For convenience, when --blob_url is unset an s3:// URL is derived from
-// --bucket and the --s3_endpoint/--s3_access_key/--s3_secret flags, which is handy
-// for S3-compatible stores such as Amazon S3 or MinIO.
-//
-// Write coordination always uses MySQL. The DSN can either be supplied directly via
-// --mysql_uri (e.g. for a Cloud SQL proxy connection) or assembled from the discrete
-// --db_host/--db_port/--db_user/--db_password/--db_name flags.
+// aws is a simple personality allowing to run conformance/compliance/performance tests and showing how to use the Tessera AWS storage implementation.
 package main
 
 import (
@@ -38,27 +27,18 @@ import (
 
 	"log/slog"
 
+	aaws "github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/go-sql-driver/mysql"
 	"github.com/transparency-dev/tessera"
-	"github.com/transparency-dev/tessera/cmd/internal/bloburl"
-	"github.com/transparency-dev/tessera/storage/objstore"
-	antispamstore "github.com/transparency-dev/tessera/storage/objstore/antispam"
-	"gocloud.dev/blob"
+	"github.com/transparency-dev/tessera/storage/aws"
+	aws_as "github.com/transparency-dev/tessera/storage/aws/antispam"
 	"golang.org/x/mod/sumdb/note"
-
-	// Register the blob drivers this binary supports. Each registers itself
-	// for its URL scheme (gs://, s3://, file://, mem://) on import; the
-	// storage/objstore library itself is driver-agnostic.
-	_ "gocloud.dev/blob/fileblob"
-	_ "gocloud.dev/blob/gcsblob"
-	_ "gocloud.dev/blob/memblob"
-	_ "gocloud.dev/blob/s3blob"
 )
 
 var (
 	bucket            = flag.String("bucket", "", "Bucket to use for storing log")
-	bucketPrefix      = flag.String("bucket_prefix", "", "Optional prefix to prepend to all log resource paths in the bucket")
-	mysqlURI          = flag.String("mysql_uri", "", "Full MySQL DSN used for write coordination, e.g. 'user@tcp(127.0.0.1:3306)/db?parseTime=true'. If set, it is used directly; otherwise the DSN is built from the --db_* flags.")
 	dbName            = flag.String("db_name", "", "AuroraDB name for the log DB")
 	dbHost            = flag.String("db_host", "", "AuroraDB host")
 	dbPort            = flag.Int("db_port", 3306, "AuroraDB port")
@@ -69,8 +49,6 @@ var (
 	s3Endpoint        = flag.String("s3_endpoint", "", "Endpoint for custom non-AWS S3 service")
 	s3AccessKeyID     = flag.String("s3_access_key", "", "Access key ID for custom non-AWS S3 service")
 	s3SecretAccessKey = flag.String("s3_secret", "", "Secret access key for custom non-AWS S3 service")
-
-	blobURL = flag.String("blob_url", "", "Optional explicit provider-scoped bucket URL for the object store, e.g. gs://BUCKET, s3://BUCKET?endpoint=...&s3ForcePathStyle=true&region=..., file:///path, mem://. If unset, a URL is derived from --bucket and the --s3_* flags. Auth is each driver's native credential chain.")
 
 	listen            = flag.String("listen", ":2024", "Address:port to listen on")
 	signer            = flag.String("signer", "", "Note signer to use to sign checkpoints")
@@ -108,24 +86,19 @@ func main() {
 	s, a := signerFromFlags()
 
 	// Create our Tessera storage backend:
-	cfg := storageConfigFromFlags(ctx)
-	defer func() {
-		if err := cfg.Bucket.Close(); err != nil {
-			slog.WarnContext(ctx, "Failed to close blob bucket", slog.Any("error", err))
-		}
-	}()
-	driver, err := objstore.New(ctx, cfg)
+	awsCfg := storageConfigFromFlags()
+	driver, err := aws.New(ctx, awsCfg)
 	if err != nil {
-		slog.ErrorContext(ctx, "Failed to create new storage", slog.Any("error", err))
+		slog.ErrorContext(ctx, "Failed to create new AWS storage", slog.Any("error", err))
 		os.Exit(1)
 	}
 	var antispam tessera.Antispam
 	// Persistent antispam is currently experimental, so there's no documentation yet!
 	if *antispamEnable {
-		asOpts := antispamstore.AntispamOpts{} // Use defaults
-		antispam, err = antispamstore.NewAntispam(ctx, antispamMysqlConfig().FormatDSN(), asOpts)
+		asOpts := aws_as.AntispamOpts{} // Use defaults
+		antispam, err = aws_as.NewAntispam(ctx, antispamMysqlConfig().FormatDSN(), asOpts)
 		if err != nil {
-			slog.ErrorContext(ctx, "Failed to create new antispam storage", slog.Any("error", err))
+			slog.ErrorContext(ctx, "Failed to create new AWS antispam storage", slog.Any("error", err))
 			os.Exit(1)
 		}
 	}
@@ -186,68 +159,33 @@ func main() {
 	}
 }
 
-// storageConfigFromFlags returns an objstore.Config struct populated with values
+// storageConfigFromFlags returns an aws.Config struct populated with values
 // provided via flags.
-//
-// The returned Config holds an open *blob.Bucket which remains open for the
-// lifetime of this process.
-func storageConfigFromFlags(ctx context.Context) objstore.Config {
-	// The object store is identified by a single blob URL. It can be provided
-	// explicitly via --blob_url, otherwise it's derived from --bucket and the
-	// --s3_* flags, so --bucket is only required when --blob_url is unset.
-	if *blobURL == "" && *bucket == "" {
-		slog.ErrorContext(ctx, "either --bucket or --blob_url must be set")
+func storageConfigFromFlags() aws.Config {
+	ctx := context.Background()
+	if *bucket == "" {
+		slog.ErrorContext(ctx, "--bucket must be set")
 		os.Exit(1)
 	}
-
-	u := blobURLFromFlags(ctx)
-	bkt, err := blob.OpenBucket(ctx, u)
-	if err != nil {
-		slog.ErrorContext(ctx, "Failed to open blob bucket", slog.String("url", u), slog.Any("error", err))
-		os.Exit(1)
-	}
-
-	return objstore.Config{
-		Bucket:       bkt,
-		BucketPrefix: *bucketPrefix,
-		DSN:          dsnFromFlags(ctx),
-		MaxOpenConns: *dbMaxConns,
-		MaxIdleConns: *dbMaxIdle,
-	}
-}
-
-// dsnFromFlags returns the MySQL DSN used for write coordination.
-//
-// If --mysql_uri is set it is used verbatim (e.g. a Cloud SQL proxy connection).
-// Otherwise the DSN is assembled from the discrete --db_* flags.
-func dsnFromFlags(ctx context.Context) string {
-	if *mysqlURI != "" {
-		return *mysqlURI
-	}
-
 	if *dbName == "" {
-		slog.ErrorContext(ctx, "--db_name must be set (or pass --mysql_uri)")
+		slog.ErrorContext(ctx, "--db_name must be set")
 		os.Exit(1)
 	}
 	if *dbHost == "" {
-		slog.ErrorContext(ctx, "--db_host must be set (or pass --mysql_uri)")
+		slog.ErrorContext(ctx, "--db_host must be set")
 		os.Exit(1)
 	}
 	if *dbPort == 0 {
-		slog.ErrorContext(ctx, "--db_port must be set (or pass --mysql_uri)")
-		os.Exit(1)
-	}
-	if *dbPort < 1 || *dbPort > 65535 {
-		slog.ErrorContext(ctx, "--db_port must be a valid port number between 1 and 65535")
+		slog.ErrorContext(ctx, "--db_port must be set")
 		os.Exit(1)
 	}
 	if *dbUser == "" {
-		slog.ErrorContext(ctx, "--db_user must be set (or pass --mysql_uri)")
+		slog.ErrorContext(ctx, "--db_user must be set")
 		os.Exit(1)
 	}
 	// Empty password isn't an option with AuroraDB MySQL.
 	if *dbPassword == "" {
-		slog.ErrorContext(ctx, "--db_password must be set (or pass --mysql_uri)")
+		slog.ErrorContext(ctx, "--db_password must be set")
 		os.Exit(1)
 	}
 
@@ -260,27 +198,32 @@ func dsnFromFlags(ctx context.Context) string {
 		AllowCleartextPasswords: true,
 		AllowNativePasswords:    true,
 	}
-	return c.FormatDSN()
-}
 
-// blobURLFromFlags derives the gocloud.dev/blob bucket URL for the object store.
-//
-// If --blob_url is set it is used verbatim (allowing gs://, file://, mem://, or a
-// fully-specified s3:// URL). Otherwise an s3:// URL is built from --bucket and
-// the --s3_* flags via bloburl.DeriveS3, which also exports any static
-// --s3_access_key / --s3_secret credentials into the AWS SDK chain for the
-// s3blob driver.
-func blobURLFromFlags(ctx context.Context) string {
-	if *blobURL != "" {
-		return *blobURL
+	// Configure to use MinIO Server
+	var awsConfig *aaws.Config
+	var s3Opts func(o *s3.Options)
+	if *s3Endpoint != "" {
+		const defaultRegion = "us-east-1"
+		s3Opts = func(o *s3.Options) {
+			o.BaseEndpoint = aaws.String(*s3Endpoint)
+			o.Credentials = credentials.NewStaticCredentialsProvider(*s3AccessKeyID, *s3SecretAccessKey, "")
+			o.Region = defaultRegion
+			o.UsePathStyle = true
+		}
+
+		awsConfig = &aaws.Config{
+			Region: defaultRegion,
+		}
 	}
 
-	u, err := bloburl.DeriveS3(*bucket, *s3Endpoint, *s3AccessKeyID, *s3SecretAccessKey)
-	if err != nil {
-		slog.ErrorContext(ctx, "Failed to derive blob URL from --bucket/--s3_* flags", slog.Any("error", err))
-		os.Exit(1)
+	return aws.Config{
+		Bucket:       *bucket,
+		SDKConfig:    awsConfig,
+		S3Options:    s3Opts,
+		DSN:          c.FormatDSN(),
+		MaxOpenConns: *dbMaxConns,
+		MaxIdleConns: *dbMaxIdle,
 	}
-	return u
 }
 
 func antispamMysqlConfig() *mysql.Config {

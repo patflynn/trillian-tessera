@@ -16,3 +16,14 @@ linters:
     sloglint:
       attr-only: true
       context: all
+  exclusions:
+    rules:
+      # cmd/conformance/aws is the unmodified pre-refactor conformance binary,
+      # kept deliberately to exercise the deprecated storage/aws compatibility
+      # wrapper end-to-end and prove backward compatibility. Its use of the
+      # deprecated package is intentional, so silence staticcheck's SA1019
+      # (use-of-deprecated) findings for it only.
+      - path: cmd/conformance/aws/
+        linters:
+          - staticcheck
+        text: "SA1019"

@@ -9,6 +9,37 @@ tested and supported target, and the rest of this document describes that deploy
 The generic [`cmd/conformance/objstore`](../../cmd/conformance/objstore/) binary
 exercises this backend against any provider (e.g. GCS via `--blob_url=gs://BUCKET`).
 
+## Library usage
+
+The application opens the bucket and passes it in, which keeps the choice of blob
+driver — and therefore which provider SDKs are compiled into your binary — in your
+hands. The driver must support `WriterOptions.IfNotExist` (the four below all do):
+
+```go
+import (
+	"gocloud.dev/blob"
+	"github.com/transparency-dev/tessera/storage/objstore"
+
+	// Import only the driver(s) you want; each registers its URL scheme.
+	_ "gocloud.dev/blob/gcsblob"  // gs://
+	_ "gocloud.dev/blob/s3blob"   // s3:// (AWS, MinIO, Ceph/RGW, R2)
+	_ "gocloud.dev/blob/fileblob" // file://
+	_ "gocloud.dev/blob/memblob"  // mem://
+)
+
+bkt, err := blob.OpenBucket(ctx, "gs://my-bucket")
+// handle err; defer bkt.Close() when the storage is no longer in use.
+
+driver, err := objstore.New(ctx, objstore.Config{
+	Bucket: bkt,
+	DSN:    "user:pass@tcp(host:3306)/dbname",
+})
+```
+
+Authentication is each driver's native credential chain (gcsblob via Application
+Default Credentials / Workload Identity; s3blob via the AWS SDK chain, including
+env vars and instance roles), so no static keys appear in code.
+
 ## Overview
 
 This design takes advantage of an object store for long-term storage and low-cost, low-complexity serving of read traffic.

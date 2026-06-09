@@ -18,13 +18,14 @@ package objstore
 // objStore interface (see objstore.go) backed by the Go CDK blob abstraction
 // (gocloud.dev/blob). A single blobStore can serve object storage from GCS, any
 // S3-compatible store (AWS S3, MinIO, Ceph/RGW, Cloudflare R2), the local
-// filesystem, or an in-memory bucket, selected purely by the bucket URL.
+// filesystem, or an in-memory bucket.
 //
-// The Go CDK is used because it exposes the primitives this backend relies on
-// uniformly across drivers:
-//   - atomic create-if-absent via WriterOptions.IfNotExist, and
-//   - each driver's native credential chain (gcsblob -> ADC/Workload Identity;
-//     s3blob -> AWS SDK chain incl. STS/HMAC) - no keys in code.
+// The *blob.Bucket is opened and owned by the caller (see Config.Bucket), which
+// keeps driver selection - and therefore which provider SDKs are compiled in -
+// in the application rather than this library. The bucket's driver must support
+// WriterOptions.IfNotExist (gcsblob, s3blob, fileblob and memblob all do), which
+// this backend relies on for the atomic create-if-absent writes that make
+// concurrent integrators safe.
 //
 // This is "Option B" in docs/design/cloud-agnostic-storage.md, and is the single
 // object-store implementation used by this package for all providers.
@@ -36,21 +37,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"path"
 
-	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/google/go-cmp/cmp"
 	"github.com/transparency-dev/tessera/internal/otel"
 	"go.opentelemetry.io/otel/trace"
 	"gocloud.dev/blob"
 	"gocloud.dev/gcerrors"
-
-	// Register the blob drivers we support. Each registers itself for its URL
-	// scheme (gs://, s3://, file://, mem://) on import.
-	_ "gocloud.dev/blob/fileblob"
-	_ "gocloud.dev/blob/gcsblob"
-	_ "gocloud.dev/blob/memblob"
-	_ "gocloud.dev/blob/s3blob"
 )
 
 // blobStore knows how to store and retrieve objects from any storage provider
@@ -60,27 +54,15 @@ type blobStore struct {
 	bucketPrefix string
 }
 
-// newBlobStore opens a *blob.Bucket from the provided provider-scoped URL and
-// returns a blobStore wrapping it.
+// newBlobStore returns a blobStore wrapping the provided open bucket.
 //
-// The URL selects both the driver and the bucket, e.g:
-//   - gs://my-bucket
-//   - s3://my-bucket?endpoint=...&s3ForcePathStyle=true&region=...
-//   - file:///var/lib/tessera
-//   - mem://
-//
-// Authentication is resolved by each driver's native chain (gcsblob via ADC /
-// Workload Identity; s3blob via the AWS SDK chain including STS/HMAC), so no
-// static keys are required or accepted here.
-func newBlobStore(ctx context.Context, url, bucketPrefix string) (*blobStore, error) {
-	b, err := blob.OpenBucket(ctx, url)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open blob bucket %q: %w", url, err)
-	}
+// The caller retains ownership of the bucket and is responsible for closing it
+// once the storage is no longer in use.
+func newBlobStore(bucket *blob.Bucket, bucketPrefix string) *blobStore {
 	return &blobStore{
-		bucket:       b,
+		bucket:       bucket,
 		bucketPrefix: bucketPrefix,
-	}, nil
+	}
 }
 
 // objectName applies the optional bucketPrefix to an object name.
@@ -93,18 +75,16 @@ func (s *blobStore) objectName(obj string) string {
 
 // getObject returns the data of the specified object, or an error.
 //
-// If the object does not exist, the returned error wraps a *types.NoSuchKey so
-// that callers (which use errors.As against that type) can detect "not found"
-// without caring which provider backs the object store.
+// If the object does not exist, the returned error wraps os.ErrNotExist so that
+// callers can detect "not found" via errors.Is without caring which provider
+// backs the object store.
 func (s *blobStore) getObject(ctx context.Context, obj string) ([]byte, error) {
 	objName := s.objectName(obj)
 
 	d, err := s.bucket.ReadAll(ctx, objName)
 	if err != nil {
 		if gcerrors.Code(err) == gcerrors.NotFound {
-			// Wrap the not-found shape higher levels expect so they can detect
-			// "not found" without caring which object store is in use.
-			return nil, fmt.Errorf("getObject: object %q not found: %w", objName, &types.NoSuchKey{})
+			return nil, fmt.Errorf("getObject: object %q not found: %w", objName, os.ErrNotExist)
 		}
 		return nil, fmt.Errorf("getObject: failed to read object %q: %w", objName, err)
 	}

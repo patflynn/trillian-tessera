@@ -20,8 +20,10 @@
 //
 // The object store is provided by the portable gocloud.dev/blob abstraction (see
 // blob.go), so the same code serves GCS, any S3-compatible store (AWS S3, MinIO,
-// Ceph/RGW, Cloudflare R2), the local filesystem or an in-memory bucket, selected
-// purely by the bucket URL in Config.BlobURL.
+// Ceph/RGW, Cloudflare R2), the local filesystem or an in-memory bucket. The
+// *blob.Bucket is opened by the application and passed in via Config.Bucket,
+// which keeps the choice of provider drivers (and their SDK dependencies) out of
+// this library.
 //
 // A single bucket is used to hold entry bundles and log internal tiles. The
 // object keys for the bucket are selected so as to conform to the expected layout
@@ -46,7 +48,6 @@ import (
 
 	"log/slog"
 
-	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/transparency-dev/merkle/rfc6962"
 	"github.com/transparency-dev/tessera"
 	"github.com/transparency-dev/tessera/api"
@@ -58,6 +59,7 @@ import (
 	storage "github.com/transparency-dev/tessera/storage/internal"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
+	"gocloud.dev/blob"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/go-sql-driver/mysql"
@@ -136,18 +138,18 @@ type consumeFunc func(ctx context.Context, from uint64, entries []storage.Sequen
 
 // Config holds project and resource configuration for a storage instance.
 type Config struct {
-	// BlobURL is the provider-scoped bucket URL identifying the object store, e.g.
-	// "gs://my-bucket", "s3://my-bucket?endpoint=...&s3ForcePathStyle=true&region=...",
-	// "file:///var/lib/tessera" or "mem://".
+	// Bucket is the open gocloud.dev/blob bucket backing the object store.
 	//
-	// The URL selects both the Go CDK blob driver (gocloud.dev/blob) and the
-	// bucket. A custom S3 endpoint, region and path-style addressing (for MinIO
-	// or other S3-compatible stores) are expressed via the URL's query
-	// parameters. Authentication is each driver's native credential chain
-	// (gcsblob -> Application Default Credentials / Workload Identity; s3blob ->
-	// the AWS SDK chain, including env vars and instance roles), so no static
-	// keys are configured here. See blob.go.
-	BlobURL string
+	// The application opens the bucket (e.g. via blob.OpenBucket and a blank
+	// import of the driver it wants - gcsblob, s3blob, fileblob or memblob),
+	// which keeps driver selection and credentials entirely in the caller's
+	// hands. The bucket's driver must support WriterOptions.IfNotExist, which
+	// this storage relies on for safe concurrent integration; the four drivers
+	// above all do.
+	//
+	// The caller retains ownership: the bucket must remain open for the lifetime
+	// of the storage, and it is the caller's responsibility to Close it.
+	Bucket *blob.Bucket
 	// BucketPrefix is an optional prefix to prepend to all log resource paths.
 	// This can be used e.g. to store multiple logs in the same bucket.
 	BucketPrefix string
@@ -167,8 +169,8 @@ type Config struct {
 // Storage instances created via this c'tor will participate in integrating newly sequenced entries into the log
 // and periodically publishing a new checkpoint which commits to the state of the tree.
 func New(ctx context.Context, cfg Config) (tessera.Driver, error) {
-	if cfg.BlobURL == "" {
-		return nil, errors.New("BlobURL must be set")
+	if cfg.Bucket == nil {
+		return nil, errors.New("Config.Bucket must be set")
 	}
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = http.DefaultClient
@@ -179,12 +181,10 @@ func New(ctx context.Context, cfg Config) (tessera.Driver, error) {
 	}, nil
 }
 
-// newObjStore constructs the portable gocloud.dev/blob-backed object store
-// selected by Config.BlobURL. The provider (GCS, S3/MinIO/Ceph/R2, local
-// filesystem, in-memory) and bucket are determined entirely by the URL. See
-// blob.go.
-func (s *Storage) newObjStore(ctx context.Context) (objStore, error) {
-	return newBlobStore(ctx, s.cfg.BlobURL, s.cfg.BucketPrefix)
+// newObjStore wraps the caller-provided Config.Bucket in the portable
+// gocloud.dev/blob-backed object store. See blob.go.
+func (s *Storage) newObjStore() objStore {
+	return newBlobStore(s.cfg.Bucket, s.cfg.BucketPrefix)
 }
 
 // Appender creates a new tessera.Appender lifecycle object.
@@ -194,12 +194,7 @@ func (s *Storage) Appender(ctx context.Context, opts *tessera.AppendOptions) (*t
 		return nil, nil, fmt.Errorf("failed to create MySQL sequencer: %v", err)
 	}
 
-	oStore, err := s.newObjStore(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	a, lr, err := s.newAppender(ctx, oStore, seq, opts)
+	a, lr, err := s.newAppender(ctx, s.newObjStore(), seq, opts)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -532,12 +527,8 @@ func (a *Appender) updateEntryBundles(ctx context.Context, fromSeq uint64, entri
 
 // MigrationWriter creates a new object-store storage for the MigrationWriter lifecycle mode.
 func (s *Storage) MigrationWriter(ctx context.Context, opts *tessera.MigrationOptions) (migrate.MigrationWriter, tessera.LogReader, error) {
-	oStore, err := s.newObjStore(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
 	logStore := &logResourceStore{
-		objStore:    oStore,
+		objStore:    s.newObjStore(),
 		entriesPath: opts.EntriesPath(),
 	}
 	seq, err := newMySQLSequencer(ctx, s.cfg.DSN, DefaultPushbackMaxOutstanding, s.cfg.MaxOpenConns, s.cfg.MaxIdleConns)
@@ -714,11 +705,8 @@ type logResourceStore struct {
 
 func (lr *logResourceStore) ReadCheckpoint(ctx context.Context) ([]byte, error) {
 	r, err := lr.get(ctx, layout.CheckpointPath)
-	if err != nil {
-		var nske *types.NoSuchKey
-		if errors.As(err, &nske) {
-			return r, os.ErrNotExist
-		}
+	if err != nil && errors.Is(err, os.ErrNotExist) {
+		return r, os.ErrNotExist
 	}
 	return r, err
 }
@@ -785,9 +773,7 @@ func (lrs *logResourceStore) getTiles(ctx context.Context, tileIDs []storage.Til
 			objName := layout.TilePath(id.Level, id.Index, layout.PartialTileSize(id.Level, id.Index, logSize))
 			data, err := lrs.objStore.getObject(ctx, objName)
 			if err != nil {
-				// Do not use errors.Is. Keep errors.As to compare by type and not by value.
-				var nske *types.NoSuchKey
-				if errors.As(err, &nske) {
+				if errors.Is(err, os.ErrNotExist) {
 					// Depending on context, this may be ok.
 					// We'll signal to higher levels that it wasn't found by retuning a nil for this tile.
 					return nil
@@ -816,9 +802,7 @@ func (lrs *logResourceStore) getEntryBundle(ctx context.Context, bundleIndex uin
 	objName := lrs.entriesPath(bundleIndex, p)
 	data, err := lrs.objStore.getObject(ctx, objName)
 	if err != nil {
-		// Do not use errors.Is. Keep errors.As to compare by type and not by value.
-		var nske *types.NoSuchKey
-		if errors.As(err, &nske) {
+		if errors.Is(err, os.ErrNotExist) {
 			// Return the generic NotExist error so that higher levels can differentiate
 			// between this and other errors.
 			return nil, fmt.Errorf("%v: %w", objName, os.ErrNotExist)
