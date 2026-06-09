@@ -214,6 +214,10 @@ func dsnFromFlags(ctx context.Context) string {
 		slog.ErrorContext(ctx, "--db_port must be set (or pass --mysql_uri)")
 		os.Exit(1)
 	}
+	if *dbPort < 1 || *dbPort > 65535 {
+		slog.ErrorContext(ctx, "--db_port must be a valid port number between 1 and 65535")
+		os.Exit(1)
+	}
 	if *dbUser == "" {
 		slog.ErrorContext(ctx, "--db_user must be set (or pass --mysql_uri)")
 		os.Exit(1)
