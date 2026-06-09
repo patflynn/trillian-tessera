@@ -238,14 +238,13 @@ jobs:
           echo "TESSERA_SIGNER=$(cat key.sec)" >> "$GITHUB_ENV"
           echo "TESSERA_VERIFIER=$(cat key.pub)" >> "$GITHUB_ENV"
 
-      # ---- The two steps below depend on the GCS+MySQL conformance binary (Phase 1 of the impl). ----
-      # Until that binary exists this job is NON-REQUIRED (see §9). Flag/flag names are placeholders
-      # to be reconciled with the actual cmd/conformance/gcs entrypoint when it lands.
+      # ---- The two steps below use the generic object-store conformance binary, ----
+      # selecting GCS via a gs:// blob URL and Cloud SQL via --mysql_uri.
       - name: Run conformance server (background)
         run: |
           MYSQL_URI="${{ vars.GCP_SQL_IAM_USER }}@tcp(127.0.0.1:3306)/${DB}?parseTime=true"
-          go run ./cmd/conformance/gcs \
-            --bucket="${BUCKET}" --mysql_uri="${MYSQL_URI}" \
+          go run ./cmd/conformance/objstore \
+            --blob_url="gs://${BUCKET}" --mysql_uri="${MYSQL_URI}" \
             --signer="${TESSERA_SIGNER}" --listen=:2024 &
           for i in $(seq 1 30); do curl -fsS localhost:2024/healthz >/dev/null 2>&1 && break; sleep 1; done
 
@@ -335,7 +334,8 @@ Notes:
 ## 9. Sequencing: when the conformance check becomes required
 
 The conformance job can't pass until **Phase 1 of the implementation** lands the native-GCS
-`objStore` and a `cmd/conformance/gcs` entrypoint (see the design doc). Therefore:
+`objStore`, exercised via the generic `cmd/conformance/objstore` entrypoint with a `gs://`
+blob URL (see the design doc). Therefore:
 
 1. **Now:** required checks = `test`, `lint`, `integration` (green today). Conformance job runs but is
    **not** in the required list.

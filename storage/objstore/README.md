@@ -5,8 +5,9 @@ implementation (via [`gocloud.dev/blob`](https://gocloud.dev/howto/blob/)) coord
 by MySQL. It is not AWS-specific — the same code serves any S3-compatible object store
 (Amazon S3, MinIO, …) as well as Google Cloud Storage, with write coordination handled
 by any MySQL-compatible database (e.g. Amazon Aurora). AWS (S3 + Aurora) is the primary
-tested and supported target, and the rest of this document describes that deployment;
-see [`cmd/conformance/gcs`](../../cmd/conformance/gcs/) for the GCS variant.
+tested and supported target, and the rest of this document describes that deployment.
+The generic [`cmd/conformance/objstore`](../../cmd/conformance/objstore/) binary
+exercises this backend against any provider (e.g. GCS via `--blob_url=gs://BUCKET`).
 
 ## Overview
 

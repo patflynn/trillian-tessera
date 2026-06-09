@@ -137,7 +137,7 @@ endpoint.
 
  1. Run the Conformance personality binary.
     ```
-    go run ./cmd/conformance/s3 \
+    go run ./cmd/conformance/objstore \
       --bucket=$LOG_BUCKET \
       --db_user=root \
       --db_password=password \
@@ -183,7 +183,7 @@ The instructions to do this for the codelab are largely the same, except:
     ```
  1. When running the conformance binary, pass in two additional flags to configure antispam:
     ```
-    go run ./cmd/conformance/s3 \
+    go run ./cmd/conformance/objstore \
       --bucket=$LOG_BUCKET \
       --db_user=root \
       --db_password=password \

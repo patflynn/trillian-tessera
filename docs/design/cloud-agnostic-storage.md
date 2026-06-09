@@ -188,8 +188,8 @@ Per the substrate decision (do both; GCS is required short-term):
 
 New Terraform/Terragrunt under `deployment/modules/gcp/`: GCS bucket + IAM (no HMAC needed),
 Cloud SQL, Artifact Registry, Cloud Run/GKE job, WIF service account. The conformance **binary**
-must construct the new `Dialect` config — so expect a new/extended `cmd/conformance/gcs/main.go`,
-not just a Dockerfile reuse.
+must construct the new `Dialect` config — so expect a new/extended generic
+`cmd/conformance/objstore/main.go` (GCS selected via a `gs://` blob URL), not just a Dockerfile reuse.
 
 > The repo already has `deployment/live/gcp/...` + `deployment/modules/gcp/gcs` for the *Spanner*
 > backend. Keep this pipeline in a clearly separate path to avoid collision.

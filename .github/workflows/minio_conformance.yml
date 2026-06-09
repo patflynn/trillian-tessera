@@ -1,7 +1,7 @@
 name: MinIO Conformance
 
 # Fully-hermetic "runs anywhere" conformance lane. It exercises the storage/objstore
-# object-store backend (cmd/conformance/s3) over S3 via the portable
+# object-store backend (cmd/conformance/objstore) over S3 via the portable
 # gocloud.dev/blob s3blob driver against a self-hosted, vendor-neutral on-prem
 # stack -- MinIO for object storage and MySQL for write coordination -- entirely
 # on the GitHub Actions runner.
@@ -121,13 +121,13 @@ jobs:
 
       - name: Run conformance server (background)
         run: |
-          # The cmd/conformance/s3 binary. A non-empty --s3_endpoint makes
+          # The cmd/conformance/objstore binary. A non-empty --s3_endpoint makes
           # storageConfigFromFlags derive an s3:// bucket URL pointing at MinIO
           # with path-style addressing (s3ForcePathStyle=true), which MinIO
           # requires, and export the static credentials into the AWS SDK chain for
           # the s3blob driver. Coordination uses MySQL via the --db_* flags.
           echo "Starting conformance server against MinIO bucket=${BUCKET} db=${DB}"
-          go run ./cmd/conformance/s3 \
+          go run ./cmd/conformance/objstore \
             --s3_endpoint="http://localhost:9000" \
             --s3_access_key="${MINIO_ROOT_USER}" \
             --s3_secret="${MINIO_ROOT_PASSWORD}" \
