@@ -109,6 +109,11 @@ func main() {
 
 	// Create our Tessera storage backend:
 	cfg := storageConfigFromFlags(ctx)
+	defer func() {
+		if err := cfg.Bucket.Close(); err != nil {
+			slog.WarnContext(ctx, "Failed to close blob bucket", slog.Any("error", err))
+		}
+	}()
 	driver, err := objstore.New(ctx, cfg)
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to create new storage", slog.Any("error", err))

@@ -107,6 +107,9 @@ type Config struct {
 // builds the S3 client from cfg exactly as previous releases did and delegates
 // to objstore.New.
 func New(ctx context.Context, cfg Config) (tessera.Driver, error) {
+	if cfg.Bucket == "" {
+		return nil, fmt.Errorf("bucket name must be provided")
+	}
 	if cfg.SDKConfig == nil {
 		// We're running on AWS so use the SDK's default config which will handle credentials etc.
 		sdkConfig, err := config.LoadDefaultConfig(ctx)
