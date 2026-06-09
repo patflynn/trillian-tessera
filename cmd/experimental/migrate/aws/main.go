@@ -164,12 +164,21 @@ func blobURLFromFlags(ctx context.Context) string {
 		return "s3://" + *bucket
 	}
 
+	// Only set the credential vars when the corresponding flags are non-empty
+	// so we don't clobber any ambient AWS credentials, and only default
+	// AWS_REGION when it isn't already configured.
 	const defaultRegion = "us-east-1"
-	for k, v := range map[string]string{
-		"AWS_ACCESS_KEY_ID":     *s3AccessKeyID,
-		"AWS_SECRET_ACCESS_KEY": *s3SecretAccessKey,
-		"AWS_REGION":            defaultRegion,
-	} {
+	envVars := make(map[string]string)
+	if *s3AccessKeyID != "" {
+		envVars["AWS_ACCESS_KEY_ID"] = *s3AccessKeyID
+	}
+	if *s3SecretAccessKey != "" {
+		envVars["AWS_SECRET_ACCESS_KEY"] = *s3SecretAccessKey
+	}
+	if _, ok := os.LookupEnv("AWS_REGION"); !ok {
+		envVars["AWS_REGION"] = defaultRegion
+	}
+	for k, v := range envVars {
 		if err := os.Setenv(k, v); err != nil {
 			slog.ErrorContext(ctx, "failed to set AWS credential env var", slog.String("var", k), slog.Any("error", err))
 			os.Exit(1)
