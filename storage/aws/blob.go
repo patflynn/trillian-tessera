@@ -26,9 +26,8 @@ package aws
 //   - each driver's native credential chain (gcsblob -> ADC/Workload Identity;
 //     s3blob -> AWS SDK chain incl. STS/HMAC) - no keys in code.
 //
-// This is "Option B" in docs/design/cloud-agnostic-storage.md. It is purely
-// additive: the s3Storage and gcsStore implementations are unchanged and remain
-// the default.
+// This is "Option B" in docs/design/cloud-agnostic-storage.md, and is the single
+// object-store implementation used by this package for all providers.
 
 import (
 	"bytes"
@@ -84,8 +83,7 @@ func newBlobStore(ctx context.Context, url, bucketPrefix string) (*blobStore, er
 	}, nil
 }
 
-// objectName applies the optional bucketPrefix to an object name, matching the
-// layout produced by s3Storage and gcsStore.
+// objectName applies the optional bucketPrefix to an object name.
 func (s *blobStore) objectName(obj string) string {
 	if s.bucketPrefix != "" {
 		return path.Join(s.bucketPrefix, obj)
@@ -96,16 +94,16 @@ func (s *blobStore) objectName(obj string) string {
 // getObject returns the data of the specified object, or an error.
 //
 // If the object does not exist, the returned error wraps a *types.NoSuchKey so
-// that callers (which use errors.As against that type) behave identically to the
-// S3 and GCS implementations.
+// that callers (which use errors.As against that type) can detect "not found"
+// without caring which provider backs the object store.
 func (s *blobStore) getObject(ctx context.Context, obj string) ([]byte, error) {
 	objName := s.objectName(obj)
 
 	d, err := s.bucket.ReadAll(ctx, objName)
 	if err != nil {
 		if gcerrors.Code(err) == gcerrors.NotFound {
-			// Mirror the s3Storage/gcsStore not-found shape so higher levels can
-			// detect "not found" without caring which object store is in use.
+			// Wrap the not-found shape higher levels expect so they can detect
+			// "not found" without caring which object store is in use.
 			return nil, fmt.Errorf("getObject: object %q not found: %w", objName, &types.NoSuchKey{})
 		}
 		return nil, fmt.Errorf("getObject: failed to read object %q: %w", objName, err)
@@ -132,7 +130,7 @@ func (s *blobStore) setObject(ctx context.Context, objName string, data []byte, 
 // The write only succeeds if no object exists under this key already. If an
 // object already exists, an error is returned *unless* the currently stored data
 // is bit-for-bit identical to the data to-be-written, in which case the write is
-// treated as idempotently successful. This mirrors s3Storage/gcsStore.
+// treated as idempotently successful.
 func (s *blobStore) setObjectIfNoneMatch(ctx context.Context, objName string, data []byte, contType string, cacheControl string) error {
 	name := s.objectName(objName)
 
@@ -167,7 +165,7 @@ func (s *blobStore) setObjectIfNoneMatch(ctx context.Context, objName string, da
 // deleteObjectsWithPrefix removes any objects with the provided prefix.
 //
 // Objects are listed via the blob iterator and removed individually, sidestepping
-// any provider-specific batch-delete semantics (mirroring gcsStore).
+// any provider-specific batch-delete semantics.
 func (s *blobStore) deleteObjectsWithPrefix(ctx context.Context, objPrefix string) error {
 	return otel.TraceErr(ctx, "tessera.storage.aws.deleteObject", tracer, func(ctx context.Context, span trace.Span) error {
 		prefix := s.objectName(objPrefix)

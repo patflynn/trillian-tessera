@@ -22,14 +22,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"time"
 
 	"log/slog"
 
-	aaws "github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/go-sql-driver/mysql"
 	"github.com/transparency-dev/tessera"
 	"github.com/transparency-dev/tessera/storage/aws"
@@ -50,8 +48,7 @@ var (
 	s3AccessKeyID     = flag.String("s3_access_key", "", "Access key ID for custom non-AWS S3 service")
 	s3SecretAccessKey = flag.String("s3_secret", "", "Secret access key for custom non-AWS S3 service")
 
-	objectStore = flag.String("object_store", "s3", "Object store backend to use: \"s3\" (default, AWS SDK) or \"blob\" (portable gocloud.dev/blob).")
-	blobURL     = flag.String("blob_url", "", "Provider-scoped bucket URL for --object_store=blob, e.g. gs://BUCKET, s3://BUCKET?endpoint=...&s3ForcePathStyle=true&region=..., file:///path, mem://. Auth is each driver's native credential chain.")
+	blobURL = flag.String("blob_url", "", "Optional explicit provider-scoped bucket URL for the object store, e.g. gs://BUCKET, s3://BUCKET?endpoint=...&s3ForcePathStyle=true&region=..., file:///path, mem://. If unset, a URL is derived from --bucket and the --s3_* flags. Auth is each driver's native credential chain.")
 
 	listen            = flag.String("listen", ":2024", "Address:port to listen on")
 	signer            = flag.String("signer", "", "Note signer to use to sign checkpoints")
@@ -166,10 +163,11 @@ func main() {
 // provided via flags.
 func storageConfigFromFlags() aws.Config {
 	ctx := context.Background()
-	// The portable blob object store encodes the bucket in --blob_url, so
-	// --bucket is not required in that mode.
-	if *objectStore != "blob" && *bucket == "" {
-		slog.ErrorContext(ctx, "--bucket must be set")
+	// The object store is identified by a single blob URL. It can be provided
+	// explicitly via --blob_url, otherwise it's derived from --bucket and the
+	// --s3_* flags, so --bucket is only required when --blob_url is unset.
+	if *blobURL == "" && *bucket == "" {
+		slog.ErrorContext(ctx, "either --bucket or --blob_url must be set")
 		os.Exit(1)
 	}
 	if *dbName == "" {
@@ -204,44 +202,66 @@ func storageConfigFromFlags() aws.Config {
 		AllowNativePasswords:    true,
 	}
 
-	// Configure to use MinIO Server
-	var awsConfig *aaws.Config
-	var s3Opts func(o *s3.Options)
-	if *s3Endpoint != "" {
-		const defaultRegion = "us-east-1"
-		s3Opts = func(o *s3.Options) {
-			o.BaseEndpoint = aaws.String(*s3Endpoint)
-			o.Credentials = credentials.NewStaticCredentialsProvider(*s3AccessKeyID, *s3SecretAccessKey, "")
-			o.Region = defaultRegion
-			o.UsePathStyle = true
-		}
-
-		awsConfig = &aaws.Config{
-			Region: defaultRegion,
-		}
-	}
-
-	cfg := aws.Config{
-		Bucket:       *bucket,
-		SDKConfig:    awsConfig,
-		S3Options:    s3Opts,
+	return aws.Config{
+		BlobURL:      blobURLFromFlags(ctx),
 		DSN:          c.FormatDSN(),
 		MaxOpenConns: *dbMaxConns,
 		MaxIdleConns: *dbMaxIdle,
 	}
+}
 
-	// Optionally route object storage through the portable gocloud.dev/blob
-	// backend. The S3 path above remains the default and is unchanged.
-	if *objectStore == "blob" {
-		if *blobURL == "" {
-			slog.ErrorContext(ctx, "--blob_url must be set when --object_store=blob")
-			os.Exit(1)
-		}
-		cfg.ObjectStore = aws.ObjectStoreBlob
-		cfg.BlobURL = *blobURL
+// blobURLFromFlags derives the gocloud.dev/blob bucket URL for the object store.
+//
+// If --blob_url is set it is used verbatim (allowing gs://, file://, mem://, or a
+// fully-specified s3:// URL). Otherwise an s3:// URL is built from --bucket and
+// the --s3_* flags:
+//   - with a custom --s3_endpoint (e.g. MinIO), the endpoint, region and
+//     path-style addressing are encoded as query parameters, and the static
+//     --s3_access_key / --s3_secret credentials are exported into the AWS SDK
+//     credential chain (via environment variables) so the s3blob driver picks
+//     them up.
+//   - without --s3_endpoint (real AWS), a plain s3://BUCKET URL is used and the
+//     region and credentials are resolved by the AWS SDK's default chain.
+func blobURLFromFlags(ctx context.Context) string {
+	if *blobURL != "" {
+		return *blobURL
 	}
 
-	return cfg
+	if *s3Endpoint == "" {
+		// Real AWS: region and credentials come from the AWS SDK default chain.
+		return "s3://" + *bucket
+	}
+
+	// Custom S3-compatible endpoint (e.g. MinIO). The s3blob driver reads
+	// credentials from the AWS SDK chain rather than the URL, so export the
+	// static credentials into the environment for it to discover. Only set the
+	// credential vars when the corresponding flags are non-empty so we don't
+	// clobber any ambient AWS credentials, and only default AWS_REGION when it
+	// isn't already configured.
+	const defaultRegion = "us-east-1"
+	envVars := make(map[string]string)
+	if *s3AccessKeyID != "" {
+		envVars["AWS_ACCESS_KEY_ID"] = *s3AccessKeyID
+	}
+	if *s3SecretAccessKey != "" {
+		envVars["AWS_SECRET_ACCESS_KEY"] = *s3SecretAccessKey
+	}
+	if _, ok := os.LookupEnv("AWS_REGION"); !ok {
+		envVars["AWS_REGION"] = defaultRegion
+	}
+	for k, v := range envVars {
+		if err := os.Setenv(k, v); err != nil {
+			slog.ErrorContext(ctx, "failed to set AWS credential env var", slog.String("var", k), slog.Any("error", err))
+			os.Exit(1)
+		}
+	}
+
+	q := url.Values{
+		"endpoint":         {*s3Endpoint},
+		"s3ForcePathStyle": {"true"},
+		"region":           {defaultRegion},
+	}
+	return "s3://" + *bucket + "?" + q.Encode()
 }
 
 func antispamMysqlConfig() *mysql.Config {

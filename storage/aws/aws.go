@@ -12,17 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package aws contains an AWS-based storage implementation for Tessera.
+// Package aws contains a MySQL-coordinated storage implementation for Tessera.
 //
 // TODO: decide whether to rename this package.
 //
-// This storage implementation uses S3 for long-term storage and serving of
-// entry bundles and log tiles, and MySQL for coordinating updates to AWS
-// when multiple instances of a personality binary are running.
+// This storage implementation uses a single object-storage bucket for long-term
+// storage and serving of entry bundles and log tiles, and MySQL for coordinating
+// updates when multiple instances of a personality binary are running.
 //
-// A single S3 bucket is used to hold entry bundles and log internal tiles.
-// The object keys for the bucket are selected so as to conform to the
-// expected layout of a tile-based log.
+// The object store is provided by the portable gocloud.dev/blob abstraction (see
+// blob.go), so the same code serves GCS, any S3-compatible store (AWS S3, MinIO,
+// Ceph/RGW, Cloudflare R2), the local filesystem or an in-memory bucket, selected
+// purely by the bucket URL in Config.BlobURL.
+//
+// A single bucket is used to hold entry bundles and log internal tiles. The
+// object keys for the bucket are selected so as to conform to the expected layout
+// of a tile-based log.
 //
 // A MySQL database provides a transactional mechanism to allow multiple
 // frontends to safely update the contents of the log.
@@ -30,29 +35,20 @@ package aws
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
 	"database/sql"
-	"encoding/base64"
 	"encoding/gob"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"log/slog"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/aws/smithy-go"
-	"github.com/google/go-cmp/cmp"
 	"github.com/transparency-dev/merkle/rfc6962"
 	"github.com/transparency-dev/tessera"
 	"github.com/transparency-dev/tessera/api"
@@ -65,7 +61,6 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
-	"google.golang.org/api/option"
 
 	"github.com/go-sql-driver/mysql"
 )
@@ -141,56 +136,20 @@ type sequencer interface {
 // Returns the updated root hash of the tree with the consumed entries integrated.
 type consumeFunc func(ctx context.Context, from uint64, entries []storage.SequencedEntry) ([]byte, error)
 
-// ObjectStore selects which object storage backend implementation is used to
-// store entry bundles, tiles and checkpoints.
-//
-// Write coordination is always handled by MySQL regardless of this value; only
-// the object store implementation changes.
-type ObjectStore int
-
-const (
-	// ObjectStoreS3 uses an S3-compatible object store via the AWS SDK. This is
-	// the default and the only configuration supported upstream.
-	ObjectStoreS3 ObjectStore = iota
-	// ObjectStoreGCS uses Google Cloud Storage via the native GCS client
-	// (cloud.google.com/go/storage), authenticating with Application Default
-	// Credentials / Workload Identity. See gcs.go.
-	ObjectStoreGCS
-	// ObjectStoreBlob uses the portable Go CDK blob abstraction
-	// (gocloud.dev/blob), selecting the provider (GCS, S3/MinIO/Ceph/R2, local
-	// filesystem, in-memory) from Config.BlobURL. Authentication is each
-	// driver's native credential chain. See blob.go.
-	ObjectStoreBlob
-)
-
-// Config holds AWS project and resource configuration for a storage instance.
+// Config holds project and resource configuration for a storage instance.
 type Config struct {
-	// ObjectStore selects the object storage backend. It defaults to
-	// ObjectStoreS3, which leaves the AWS/S3 code path unchanged.
-	ObjectStore ObjectStore
-	// GCSOptions holds optional client options passed to the native GCS client
-	// when ObjectStore is ObjectStoreGCS. This is primarily useful in tests, to
-	// point the client at a fake GCS server. If unset, the client uses
-	// Application Default Credentials / Workload Identity.
-	GCSOptions []option.ClientOption
-	// BlobURL is the provider-scoped bucket URL used when ObjectStore is
-	// ObjectStoreBlob, e.g. "gs://my-bucket", "s3://my-bucket?endpoint=...",
-	// "file:///var/lib/tessera" or "mem://". The URL selects both the Go CDK
-	// blob driver and the bucket; authentication is the driver's native chain.
+	// BlobURL is the provider-scoped bucket URL identifying the object store, e.g.
+	// "gs://my-bucket", "s3://my-bucket?endpoint=...&s3ForcePathStyle=true&region=...",
+	// "file:///var/lib/tessera" or "mem://".
+	//
+	// The URL selects both the Go CDK blob driver (gocloud.dev/blob) and the
+	// bucket. A custom S3 endpoint, region and path-style addressing (for MinIO
+	// or other S3-compatible stores) are expressed via the URL's query
+	// parameters. Authentication is each driver's native credential chain
+	// (gcsblob -> Application Default Credentials / Workload Identity; s3blob ->
+	// the AWS SDK chain, including env vars and instance roles), so no static
+	// keys are configured here. See blob.go.
 	BlobURL string
-	// SDKConfig is an optional AWS config to use when configuring service clients, e.g. to
-	// use non-AWS S3 or MySQL services.
-	//
-	// If nil, the value from config.LoadDefaultConfig() will be used - this is the only
-	// supported configuration.
-	SDKConfig *aws.Config
-	// S3Options is an optional function which can be used to configure the S3 library.
-	// This is primarily useful when configuring the use of non-AWS S3 or MySQL services.
-	//
-	// If nil, the default options will be used - this is the only supported configuration.
-	S3Options func(*s3.Options)
-	// Bucket is the name of the S3 bucket to use for storing log state.
-	Bucket string
 	// BucketPrefix is an optional prefix to prepend to all log resource paths.
 	// This can be used e.g. to store multiple logs in the same bucket.
 	BucketPrefix string
@@ -210,22 +169,8 @@ type Config struct {
 // Storage instances created via this c'tor will participate in integrating newly sequenced entries into the log
 // and periodically publishing a new checkpoint which commits to the state of the tree.
 func New(ctx context.Context, cfg Config) (tessera.Driver, error) {
-	// The AWS SDK config is only needed for the S3 object store. The GCS object
-	// store uses the native GCS client and its own credential resolution.
-	if cfg.ObjectStore == ObjectStoreS3 {
-		if cfg.SDKConfig == nil {
-			// We're running on AWS so use the SDK's default config which will will handle credentials etc.
-			sdkConfig, err := config.LoadDefaultConfig(ctx)
-			if err != nil {
-				return nil, fmt.Errorf("failed to load default AWS configuration: %v", err)
-			}
-			cfg.SDKConfig = &sdkConfig
-			// We need a non-nil options func to pass in to s3.NewFromConfig below or it'll panic, so
-			// we'll use a "do nothing" placeholder.
-			cfg.S3Options = func(_ *s3.Options) {}
-		} else {
-			printDragonsWarning()
-		}
+	if cfg.BlobURL == "" {
+		return nil, errors.New("BlobURL must be set")
 	}
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = http.DefaultClient
@@ -236,25 +181,12 @@ func New(ctx context.Context, cfg Config) (tessera.Driver, error) {
 	}, nil
 }
 
-// newObjStore constructs the object store implementation selected by the Config.
-//
-// By default this builds the S3-backed s3Storage, leaving the AWS code path
-// unchanged. When Config.ObjectStore is ObjectStoreGCS, it builds a native
-// GCS-backed gcsStore; when ObjectStoreBlob, it builds a portable
-// gocloud.dev/blob-backed blobStore selected by Config.BlobURL.
+// newObjStore constructs the portable gocloud.dev/blob-backed object store
+// selected by Config.BlobURL. The provider (GCS, S3/MinIO/Ceph/R2, local
+// filesystem, in-memory) and bucket are determined entirely by the URL. See
+// blob.go.
 func (s *Storage) newObjStore(ctx context.Context) (objStore, error) {
-	switch s.cfg.ObjectStore {
-	case ObjectStoreGCS:
-		return newGCSStore(ctx, s.cfg.Bucket, s.cfg.BucketPrefix, s.cfg.GCSOptions...)
-	case ObjectStoreBlob:
-		return newBlobStore(ctx, s.cfg.BlobURL, s.cfg.BucketPrefix)
-	default:
-		return &s3Storage{
-			s3Client:     s3.NewFromConfig(*s.cfg.SDKConfig, s.cfg.S3Options),
-			bucket:       s.cfg.Bucket,
-			bucketPrefix: s.cfg.BucketPrefix,
-		}, nil
-	}
+	return newBlobStore(ctx, s.cfg.BlobURL, s.cfg.BucketPrefix)
 }
 
 // Appender creates a new tessera.Appender lifecycle object.
@@ -1527,141 +1459,4 @@ func placeholder(n int) string {
 		places[i] = "?"
 	}
 	return strings.Join(places, ",")
-}
-
-// s3Storage knows how to store and retrieve objects from S3.
-type s3Storage struct {
-	bucket       string
-	bucketPrefix string
-	s3Client     *s3.Client
-}
-
-// getObject returns the data of the specified object, or an error.
-func (s *s3Storage) getObject(ctx context.Context, obj string) ([]byte, error) {
-	if s.bucketPrefix != "" {
-		obj = filepath.Join(s.bucketPrefix, obj)
-	}
-
-	r, err := s.s3Client.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(s.bucket),
-		Key:    aws.String(obj),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("getObject: failed to create reader for object %q in bucket %q: %w", obj, s.bucket, err)
-	}
-
-	d, err := io.ReadAll(r.Body)
-	if err != nil {
-		return nil, fmt.Errorf("getObject: failed to read %q: %v", obj, err)
-	}
-	return d, r.Body.Close()
-}
-
-// setObject stores the provided data in the specified object.
-func (s *s3Storage) setObject(ctx context.Context, objName string, data []byte, contType string, cacheControl string) error {
-	if s.bucketPrefix != "" {
-		objName = filepath.Join(s.bucketPrefix, objName)
-	}
-
-	put := &s3.PutObjectInput{
-		Bucket:       aws.String(s.bucket),
-		Key:          aws.String(objName),
-		Body:         bytes.NewReader(data),
-		ContentType:  aws.String(contType),
-		CacheControl: aws.String(cacheControl),
-	}
-
-	if _, err := s.s3Client.PutObject(ctx, put); err != nil {
-		return fmt.Errorf("failed to write object %q to bucket %q: %w", objName, s.bucket, err)
-	}
-	return nil
-}
-
-// setObjectIfNoneMatch stores data in the specified object gated by a IfNoneMatch condition.
-//
-// ifNoneMatch can be used to specify the IfNoneMatch preconditions for the write, i.e write
-// iff no object exists under this key already. If an object already exists under the same key,
-// an error will be returned *unless*  the currently stored data is bit-for-bit identical to the
-// data to-be-written. This is intended to provide idempotentency for writes.
-func (s *s3Storage) setObjectIfNoneMatch(ctx context.Context, objName string, data []byte, contType string, cacheControl string) error {
-	if s.bucketPrefix != "" {
-		objName = filepath.Join(s.bucketPrefix, objName)
-	}
-
-	put := &s3.PutObjectInput{
-		Bucket:       aws.String(s.bucket),
-		Key:          aws.String(objName),
-		Body:         bytes.NewReader(data),
-		ContentType:  aws.String(contType),
-		CacheControl: aws.String(cacheControl),
-		// "*" is the expected character for this condition
-		IfNoneMatch: aws.String("*"),
-	}
-
-	if _, err := s.s3Client.PutObject(ctx, put); err != nil {
-
-		// If we run into a precondition failure error, check that the object
-		// which exists contains the same content that we want to write.
-		// If so, we can consider this write to be idempotently successful.
-		var apiErr smithy.APIError
-		if errors.As(err, &apiErr) && apiErr.ErrorCode() == "PreconditionFailed" {
-			existing, err := s.getObject(ctx, objName)
-			if err != nil {
-				return fmt.Errorf("failed to fetch existing content for %q: %v", objName, err)
-			}
-			if !bytes.Equal(existing, data) {
-				slog.ErrorContext(ctx, "Resource non-idempotent writen", slog.String("objname", objName), slog.String("diff", cmp.Diff(existing, data)))
-				return fmt.Errorf("precondition failed: resource content for %q differs from data to-be-written", objName)
-			}
-
-			slog.DebugContext(ctx, "setObjectIfNoneMatch: identical resource already exists. Continuing", slog.String("objname", objName))
-			return nil
-		}
-
-		return fmt.Errorf("failed to write object %q to bucket %q: %w", objName, s.bucket, err)
-	}
-	return nil
-}
-
-// deleteObjectsWithPrefix removes any objects with the provided prefix from S3.
-func (s *s3Storage) deleteObjectsWithPrefix(ctx context.Context, objPrefix string) error {
-	return otel.TraceErr(ctx, "tessera.storage.aws.deleteObject", tracer, func(ctx context.Context, span trace.Span) error {
-		if s.bucketPrefix != "" {
-			objPrefix = filepath.Join(s.bucketPrefix, objPrefix)
-		}
-		span.SetAttributes(objectPathKey.String(objPrefix))
-
-		l, err := s.s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-			Bucket: aws.String(s.bucket),
-			Prefix: aws.String(objPrefix),
-		})
-		if err != nil {
-			return fmt.Errorf("failed to list objects with prefix %q: %v", objPrefix, err)
-		}
-		di := &s3.DeleteObjectsInput{
-			Bucket: aws.String(s.bucket),
-			Delete: &types.Delete{
-				Objects: make([]types.ObjectIdentifier, 0, len(l.Contents)),
-			},
-		}
-		for _, k := range l.Contents {
-			slog.DebugContext(ctx, "Deleting object", slog.String("key", *k.Key))
-			di.Delete.Objects = append(di.Delete.Objects, types.ObjectIdentifier{Key: k.Key})
-		}
-		if _, err := s.s3Client.DeleteObjects(ctx, di); err != nil {
-			return fmt.Errorf("failed to delete objects: %v", err)
-		}
-		return nil
-	})
-}
-
-func printDragonsWarning() {
-	d := `H4sIAFZYZGcAA01QMQ7EIAzbeYXV5UCqkq1bf2IFtpNuPalj334hFQdkwLGNAwBzyXnKitOiqTYj
-B7ZGplWEwZhZqxZ1aKuswcD0AA4GXPUhI0MEpSd5Ow09vJ+m6rVtF6m0GDccYXDZEdp9N/g1H9Pf
-Qu80vNj7tiOe0lkdc8hwZK9YxavT0+FTP++vU6DUKvpEOr1+VGTk3IBXKSX9AHz5xXRgAQAA`
-	g, _ := base64.StdEncoding.DecodeString(d)
-	r, _ := gzip.NewReader(bytes.NewReader(g))
-	t, _ := io.ReadAll(r)
-	slog.InfoContext(context.Background(), "Running in non-AWS mode - see storage/aws/README.md for more details.")
-	slog.InfoContext(context.Background(), "Here be dragons!\n", slog.Any("t", t))
 }

@@ -25,9 +25,6 @@ import (
 
 	"log/slog"
 
-	aaws "github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/go-sql-driver/mysql"
 	"github.com/transparency-dev/tessera"
 	"github.com/transparency-dev/tessera/client"
@@ -145,29 +142,53 @@ func storageConfigFromFlags() aws.Config {
 		AllowNativePasswords:    true,
 	}
 
-	// Configure to use MinIO Server
-	var awsConfig *aaws.Config
-	var s3Opts func(o *s3.Options)
-	if *s3Endpoint != "" {
-		const defaultRegion = "us-east-1"
-		s3Opts = func(o *s3.Options) {
-			o.BaseEndpoint = aaws.String(*s3Endpoint)
-			o.Credentials = credentials.NewStaticCredentialsProvider(*s3AccessKeyID, *s3SecretAccessKey, "")
-			o.Region = defaultRegion
-			o.UsePathStyle = true
-		}
-
-		awsConfig = &aaws.Config{
-			Region: defaultRegion,
-		}
-	}
-
 	return aws.Config{
-		Bucket:       *bucket,
-		SDKConfig:    awsConfig,
-		S3Options:    s3Opts,
+		BlobURL:      blobURLFromFlags(context.Background()),
 		DSN:          c.FormatDSN(),
 		MaxOpenConns: *dbMaxConns,
 		MaxIdleConns: *dbMaxIdle,
 	}
+}
+
+// blobURLFromFlags derives the gocloud.dev/blob bucket URL for the object store
+// from --bucket and the --s3_* flags.
+//
+// With a custom --s3_endpoint (e.g. MinIO), the endpoint, region and path-style
+// addressing are encoded as query parameters, and the static --s3_access_key /
+// --s3_secret credentials are exported into the AWS SDK credential chain (via
+// environment variables) so the s3blob driver picks them up. Without
+// --s3_endpoint (real AWS), a plain s3://BUCKET URL is used and the region and
+// credentials are resolved by the AWS SDK's default chain.
+func blobURLFromFlags(ctx context.Context) string {
+	if *s3Endpoint == "" {
+		return "s3://" + *bucket
+	}
+
+	// Only set the credential vars when the corresponding flags are non-empty
+	// so we don't clobber any ambient AWS credentials, and only default
+	// AWS_REGION when it isn't already configured.
+	const defaultRegion = "us-east-1"
+	envVars := make(map[string]string)
+	if *s3AccessKeyID != "" {
+		envVars["AWS_ACCESS_KEY_ID"] = *s3AccessKeyID
+	}
+	if *s3SecretAccessKey != "" {
+		envVars["AWS_SECRET_ACCESS_KEY"] = *s3SecretAccessKey
+	}
+	if _, ok := os.LookupEnv("AWS_REGION"); !ok {
+		envVars["AWS_REGION"] = defaultRegion
+	}
+	for k, v := range envVars {
+		if err := os.Setenv(k, v); err != nil {
+			slog.ErrorContext(ctx, "failed to set AWS credential env var", slog.String("var", k), slog.Any("error", err))
+			os.Exit(1)
+		}
+	}
+
+	q := url.Values{
+		"endpoint":         {*s3Endpoint},
+		"s3ForcePathStyle": {"true"},
+		"region":           {defaultRegion},
+	}
+	return "s3://" + *bucket + "?" + q.Encode()
 }

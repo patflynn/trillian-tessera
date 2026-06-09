@@ -1,9 +1,9 @@
 name: GCP GCS Conformance
 
-# Exercises the native-GCS object store (storage/aws/gcs.go, selected via
-# aws.Config.ObjectStore = ObjectStoreGCS) end-to-end against real GCS + Cloud SQL
-# (MySQL) on every PR. Coordination stays on MySQL exactly as the AWS backend does;
-# only the object store differs (GCS instead of S3).
+# Exercises the GCS object store (storage/aws/blob.go, selected via a gs:// bucket
+# URL in aws.Config.BlobURL) end-to-end against real GCS + Cloud SQL (MySQL) on
+# every PR. Coordination stays on MySQL exactly as the AWS backend does; only the
+# object store provider differs (gcsblob instead of s3blob).
 #
 # Everything is keyless: GitHub Actions federates to GCP via Workload Identity
 # (google-github-actions/auth), the conformance server's GCS client uses the

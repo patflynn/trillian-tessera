@@ -1,17 +1,18 @@
 name: MinIO Conformance
 
-# Fully-hermetic "runs anywhere" conformance lane. It exercises the EXISTING
-# storage/aws S3 object-store backend (cmd/conformance/aws, the s3Storage path)
-# against a self-hosted, vendor-neutral on-prem stack -- MinIO for object storage
-# and MySQL for write coordination -- entirely on the GitHub Actions runner.
+# Fully-hermetic "runs anywhere" conformance lane. It exercises the storage/aws
+# object-store backend (cmd/conformance/aws) over S3 via the portable
+# gocloud.dev/blob s3blob driver against a self-hosted, vendor-neutral on-prem
+# stack -- MinIO for object storage and MySQL for write coordination -- entirely
+# on the GitHub Actions runner.
 #
 # No GCP, no cloud, no Workload Identity, no stored secrets: the MinIO credentials
 # are throwaway values defined inline below, and every dependency (MySQL, MinIO,
 # the conformance server, the hammer) runs on the runner and dies with it. This
 # proves the core thesis of docs/design/cloud-agnostic-storage.md: the same
-# storage/aws S3 objStore + MySQL coordination runs on a vendor-neutral on-prem
-# stack with no code changes beyond the S3 path-style addressing the binary
-# already enables for a custom --s3_endpoint.
+# storage/aws blob objStore + MySQL coordination runs on a vendor-neutral on-prem
+# stack, with the S3 endpoint, region and path-style addressing expressed through
+# the s3:// bucket URL the binary derives from a custom --s3_endpoint.
 
 on:
   pull_request:
@@ -73,8 +74,8 @@ jobs:
       - name: Start MinIO (S3-compatible object store)
         run: |
           # Self-hosted, S3-native object store. Publishes the S3 API on :9000
-          # (and the console on :9001). The conformance server's existing AWS S3
-          # client talks to it via --s3_endpoint with path-style addressing.
+          # (and the console on :9001). The conformance server's s3blob driver
+          # talks to it via --s3_endpoint with path-style addressing.
           docker run -d --name minio \
             -p 9000:9000 -p 9001:9001 \
             -e "MINIO_ROOT_USER=${MINIO_ROOT_USER}" \
@@ -120,10 +121,11 @@ jobs:
 
       - name: Run conformance server (background)
         run: |
-          # The EXISTING cmd/conformance/aws binary (s3Storage path). A non-empty
-          # --s3_endpoint makes storageConfigFromFlags point the AWS S3 client at
-          # MinIO and enable path-style addressing (UsePathStyle=true), which
-          # MinIO requires. Coordination uses MySQL via the --db_* flags.
+          # The cmd/conformance/aws binary. A non-empty --s3_endpoint makes
+          # storageConfigFromFlags derive an s3:// bucket URL pointing at MinIO
+          # with path-style addressing (s3ForcePathStyle=true), which MinIO
+          # requires, and export the static credentials into the AWS SDK chain for
+          # the s3blob driver. Coordination uses MySQL via the --db_* flags.
           echo "Starting conformance server against MinIO bucket=${BUCKET} db=${DB}"
           go run ./cmd/conformance/aws \
             --s3_endpoint="http://localhost:9000" \
