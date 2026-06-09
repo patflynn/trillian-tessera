@@ -170,7 +170,7 @@ type Config struct {
 // and periodically publishing a new checkpoint which commits to the state of the tree.
 func New(ctx context.Context, cfg Config) (tessera.Driver, error) {
 	if cfg.Bucket == nil {
-		return nil, errors.New("Bucket must be set")
+		return nil, errors.New("Config.Bucket must be set")
 	}
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = http.DefaultClient
