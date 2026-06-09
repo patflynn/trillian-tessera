@@ -177,8 +177,8 @@ jobs:
           MYSQL_USER="${SA_EMAIL%%@*}"
           MYSQL_URI="${MYSQL_USER}@tcp(127.0.0.1:3306)/${DB}?parseTime=true"
           echo "Starting conformance server as MySQL user '${MYSQL_USER}' against bucket=${BUCKET} db=${DB}"
-          go run ./cmd/conformance/gcs \
-            --bucket="${BUCKET}" \
+          go run ./cmd/conformance/objstore \
+            --blob_url="gs://${BUCKET}" \
             --mysql_uri="${MYSQL_URI}" \
             --signer="${TESSERA_SIGNER}" \
             --listen=:2024 >"${{ runner.temp }}/conformance.log" 2>&1 &

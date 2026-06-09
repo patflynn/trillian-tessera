@@ -12,7 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// s3 is a simple personality for running conformance/compliance/performance tests against any S3-compatible object store (Amazon S3, MinIO, ...) backed by MySQL coordination.
+// objstore is a generic personality for running conformance/compliance/performance
+// tests against any gocloud.dev/blob object store backed by MySQL coordination.
+//
+// The object store is selected with a single provider-scoped bucket URL passed via
+// --blob_url (e.g. gs://BUCKET, s3://BUCKET?endpoint=...&region=..., file:///path,
+// mem://). For convenience, when --blob_url is unset an s3:// URL is derived from
+// --bucket and the --s3_endpoint/--s3_access_key/--s3_secret flags, which is handy
+// for S3-compatible stores such as Amazon S3 or MinIO.
+//
+// Write coordination always uses MySQL. The DSN can either be supplied directly via
+// --mysql_uri (e.g. for a Cloud SQL proxy connection) or assembled from the discrete
+// --db_host/--db_port/--db_user/--db_password/--db_name flags.
 package main
 
 import (
@@ -37,6 +48,8 @@ import (
 
 var (
 	bucket            = flag.String("bucket", "", "Bucket to use for storing log")
+	bucketPrefix      = flag.String("bucket_prefix", "", "Optional prefix to prepend to all log resource paths in the bucket")
+	mysqlURI          = flag.String("mysql_uri", "", "Full MySQL DSN used for write coordination, e.g. 'user@tcp(127.0.0.1:3306)/db?parseTime=true'. If set, it is used directly; otherwise the DSN is built from the --db_* flags.")
 	dbName            = flag.String("db_name", "", "AuroraDB name for the log DB")
 	dbHost            = flag.String("db_host", "", "AuroraDB host")
 	dbPort            = flag.Int("db_port", 3306, "AuroraDB port")
@@ -170,25 +183,48 @@ func storageConfigFromFlags() objstore.Config {
 		slog.ErrorContext(ctx, "either --bucket or --blob_url must be set")
 		os.Exit(1)
 	}
+
+	return objstore.Config{
+		BlobURL:      blobURLFromFlags(ctx),
+		BucketPrefix: *bucketPrefix,
+		DSN:          dsnFromFlags(ctx),
+		MaxOpenConns: *dbMaxConns,
+		MaxIdleConns: *dbMaxIdle,
+	}
+}
+
+// dsnFromFlags returns the MySQL DSN used for write coordination.
+//
+// If --mysql_uri is set it is used verbatim (e.g. a Cloud SQL proxy connection).
+// Otherwise the DSN is assembled from the discrete --db_* flags.
+func dsnFromFlags(ctx context.Context) string {
+	if *mysqlURI != "" {
+		return *mysqlURI
+	}
+
 	if *dbName == "" {
-		slog.ErrorContext(ctx, "--db_name must be set")
+		slog.ErrorContext(ctx, "--db_name must be set (or pass --mysql_uri)")
 		os.Exit(1)
 	}
 	if *dbHost == "" {
-		slog.ErrorContext(ctx, "--db_host must be set")
+		slog.ErrorContext(ctx, "--db_host must be set (or pass --mysql_uri)")
 		os.Exit(1)
 	}
 	if *dbPort == 0 {
-		slog.ErrorContext(ctx, "--db_port must be set")
+		slog.ErrorContext(ctx, "--db_port must be set (or pass --mysql_uri)")
+		os.Exit(1)
+	}
+	if *dbPort < 1 || *dbPort > 65535 {
+		slog.ErrorContext(ctx, "--db_port must be a valid port number between 1 and 65535")
 		os.Exit(1)
 	}
 	if *dbUser == "" {
-		slog.ErrorContext(ctx, "--db_user must be set")
+		slog.ErrorContext(ctx, "--db_user must be set (or pass --mysql_uri)")
 		os.Exit(1)
 	}
 	// Empty password isn't an option with AuroraDB MySQL.
 	if *dbPassword == "" {
-		slog.ErrorContext(ctx, "--db_password must be set")
+		slog.ErrorContext(ctx, "--db_password must be set (or pass --mysql_uri)")
 		os.Exit(1)
 	}
 
@@ -201,13 +237,7 @@ func storageConfigFromFlags() objstore.Config {
 		AllowCleartextPasswords: true,
 		AllowNativePasswords:    true,
 	}
-
-	return objstore.Config{
-		BlobURL:      blobURLFromFlags(ctx),
-		DSN:          c.FormatDSN(),
-		MaxOpenConns: *dbMaxConns,
-		MaxIdleConns: *dbMaxIdle,
-	}
+	return c.FormatDSN()
 }
 
 // blobURLFromFlags derives the gocloud.dev/blob bucket URL for the object store.
