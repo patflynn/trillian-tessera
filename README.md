@@ -158,7 +158,7 @@ Take a look at the example personalities in the `/cmd/` directory:
     - This example runs an HTTP web server that takes arbitrary data and adds it to a file-based log.
   - [gcp](./cmd/conformance/gcp/): example of operating a log running in GCP.
     - This example can be deployed via terraform, see the [deployment instructions](./deployment/live/gcp/conformance#manual-deployment).
-  - [s3](./cmd/conformance/s3/): example of operating a log running on AWS.
+  - [s3](./cmd/conformance/s3/): example of operating a log running on AWS or other S3-compatible object stores.
     - This example can be deployed via terraform, see the [deployment instructions](./deployment/live/aws/codelab#aws-codelab-deployment).
   - [posix-oneshot](./cmd/examples/posix-oneshot/): example of a command line tool to add entries to a log stored on the local filesystem
     - This example is not a long-lived process; running the command integrates entries into the log which lives only as files.
