@@ -23,7 +23,11 @@ permissions:
   contents: read
 
 concurrency:
-  group: minio-conformance
+  # Per-PR group (keyed on github.ref) so distinct PRs never cancel each other's
+  # runs. This lane is fully hermetic -- MySQL, MinIO, the conformance server and
+  # the hammer all run on the GitHub Actions runner and share no external state --
+  # so different PRs can safely run it concurrently.
+  group: minio-conformance-${{ github.ref }}
   cancel-in-progress: false
 
 env:
