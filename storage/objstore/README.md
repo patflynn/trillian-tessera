@@ -1,18 +1,24 @@
-# Tessera on Amazon Web Services
+# Tessera on a portable object store + MySQL
 
-This document describes the storage implementation for running Tessera on Amazon Web Services (AWS).
+This document describes the `storage/objstore` backend: a portable object-store
+implementation (via [`gocloud.dev/blob`](https://gocloud.dev/howto/blob/)) coordinated
+by MySQL. It is not AWS-specific — the same code serves any S3-compatible object store
+(Amazon S3, MinIO, …) as well as Google Cloud Storage, with write coordination handled
+by any MySQL-compatible database (e.g. Amazon Aurora). AWS (S3 + Aurora) is the primary
+tested and supported target, and the rest of this document describes that deployment;
+see [`cmd/conformance/gcs`](../../cmd/conformance/gcs/) for the GCS variant.
 
 ## Overview
 
-This design takes advantage of Amazon S3 for long-term storage and low-cost, low-complexity serving of read traffic.
-It uses Amazon Aurora (MySQL) for coordinating writes.
+This design takes advantage of an object store for long-term storage and low-cost, low-complexity serving of read traffic.
+It uses a MySQL-compatible database (e.g. Amazon Aurora) for coordinating writes.
 
 New entries flow in from the binary built with Tessera into transactional storage, where they're held
 temporarily to batch them up, and then assigned sequence numbers as each batch is flushed.
 This allows the `Add` API call to quickly return with *durably assigned* sequence numbers.
 
 From there, an async process derives the entry bundles and Merkle tree structure from the sequenced batches,
-writes these to GCS for serving, before finally removing integrated bundles from the transactional storage.
+writes these to the object store for serving, before finally removing integrated bundles from the transactional storage.
 
 Since entries are all sequenced by the time they're stored, and sequencing is done in "chunks", it's worth
 noting that all tree derivations are therefore idempotent.

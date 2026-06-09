@@ -2,7 +2,7 @@
 
 **Status:** Draft (rev 2) · **Owner:** patflynn · **Scope:** personal fork experiment (`patflynn/trillian-tessera`)
 
-**Chosen direction (2026-06-05):** Keep `storage/aws`'s MySQL coordination + integration logic;
+**Chosen direction (2026-06-05):** Keep `storage/objstore`'s MySQL coordination + integration logic;
 make the **object store a pluggable implementation behind the existing `objStore` interface**.
 Ship a **native-GCS-client** implementation first (GCS is required short-term), then evaluate a
 single `gocloud.dev/blob`-backed implementation for true run-anywhere. Firestore-native backend
@@ -17,7 +17,7 @@ deferred (plan preserved on the `firestore-plan` branch).
 
 ## Summary
 
-Tessera's `storage/aws` backend has two separable halves:
+Tessera's `storage/objstore` backend has two separable halves:
 
 1. **Object storage** — get/put/conditional-put/delete of bundles, tiles, checkpoints. Already
    abstracted behind an unexported **`objStore` interface** (4 methods).
@@ -56,7 +56,7 @@ supported choice everywhere.**
 
 ## Background: what the "AWS" backend actually is
 
-From `storage/aws/aws.go` (~1,600 LOC at upstream `63f846b`; cite by symbol, not line — the file
+From `storage/objstore/objstore.go` (~1,600 LOC at upstream `63f846b`; cite by symbol, not line — the file
 churns, e.g. +457 lines in one recent sync):
 
 | Concern | Implementation | AWS-specific? |
@@ -65,7 +65,7 @@ churns, e.g. +457 lines in one recent sync):
 | Write coordination | MySQL tables, standard SQL (`FOR UPDATE`, `INSERT IGNORE`) | No — plain MySQL |
 | Client construction | `config.LoadDefaultConfig` + `s3.NewFromConfig` | Yes, but injectable |
 
-The reusable seam — **`objStore`** (`type objStore interface` in `aws.go`):
+The reusable seam — **`objStore`** (`type objStore interface` in `objstore.go`):
 
 ```go
 type objStore interface {
@@ -197,7 +197,7 @@ not just a Dockerfile reuse.
 ## Relationship to existing GCP work
 
 - **`storage/gcp` (native GCS + Spanner)** already exists. This design is deliberately different:
-  native GCS object store **+ MySQL** coordination, reusing `storage/aws`'s sequencer/integration.
+  native GCS object store **+ MySQL** coordination, reusing `storage/objstore`'s sequencer/integration.
   The point is portability of the *coordination + integration* code across providers, not a second
   Spanner backend. (If MySQL-coordination scaling becomes the bottleneck, the Spanner backend is
   the answer — see S2.)
@@ -211,7 +211,7 @@ not just a Dockerfile reuse.
 - Same coordination + integration code on GCS+Cloud SQL, on-prem k8s+MinIO+MySQL, and AWS S3+Aurora.
 - A correct, **secret-less GCS** backend via the native client (short-term necessity).
 - GCP conformance CI (lane 1), then MinIO-on-GKE CI (lane 2).
-- **Strictly additive within `storage/aws`:** new file(s) for the GCS impl + one constructor branch.
+- **Strictly additive within `storage/objstore`:** new file(s) for the GCS impl + one constructor branch.
   The AWS path is byte-for-byte unchanged at runtime. **No package rename** in the fork (rename is
   an upstream-only concern; renaming maximizes rebase pain — see S3).
 
@@ -254,7 +254,7 @@ not just a Dockerfile reuse.
 4. **🟠 Unexported reuse / rebase tax** — `objStore`, `sequencer`, integration are unexported in
    package `aws`; the GCS impl must live there and add one constructor branch. Keep the diff tiny;
    upstream churns `aws.go` heavily (+457 lines in one sync).
-5. **🟠 Naming smell** — a GCS-native file inside `storage/aws` is confusing, and `storage/gcp`
+5. **🟠 Naming smell** — a GCS-native file inside `storage/objstore` is confusing, and `storage/gcp`
    already means GCS+Spanner. Tolerate in the fork (minimal diff); only resolve via rename if/when
    upstreaming.
 6. **🟠 MySQL coordination ceiling (S2)** — single `FOR UPDATE` serialization point; fine for the
@@ -270,7 +270,7 @@ not just a Dockerfile reuse.
 
 ## Appendix: key code references (by symbol — line numbers rot)
 
-- `objStore` interface + `s3Storage` impl — `storage/aws/aws.go`
+- `objStore` interface + `s3Storage` impl — `storage/objstore/objstore.go`
 - `setObjectIfNoneMatch` — the create-if-absent primitive; idempotency keys off
   `smithy.APIError.ErrorCode() == "PreconditionFailed"` (must be re-implemented for the GCS 412 path)
 - `deleteObjectsWithPrefix` — GC path; currently S3 `ListObjectsV2` + batch `DeleteObjects`
@@ -281,4 +281,4 @@ not just a Dockerfile reuse.
 - Go CDK — `gocloud.dev/blob`: `WriterOptions.IfNotExist`, `gcerrors.PreconditionFailed`
 - CI to mirror — `.github/workflows/aws_integration_test.yml`; `deployment/{live,modules}/aws/`
 - Verified against upstream `63f846b`; standalone `storage/mysql` removed upstream, but
-  `storage/aws` still embeds MySQL coordination.
+  `storage/objstore` still embeds MySQL coordination.

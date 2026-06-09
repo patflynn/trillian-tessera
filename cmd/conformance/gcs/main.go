@@ -15,8 +15,8 @@
 // gcs is a simple personality allowing to run conformance/compliance/performance
 // tests against Google Cloud Storage backed by MySQL coordination.
 //
-// It is modelled closely on cmd/conformance/aws: write coordination is handled by
-// MySQL exactly as the AWS backend does (same sequencer/integration schema); the
+// It is modelled closely on cmd/conformance/s3: write coordination is handled by
+// MySQL exactly as the S3 backend does (same sequencer/integration schema); the
 // only difference is the object store is selected with a gs:// bucket URL rather
 // than an s3:// one. Both run through the same portable gocloud.dev/blob object
 // store. The gcsblob driver authenticates using Application Default Credentials /
@@ -38,7 +38,7 @@ import (
 	"log/slog"
 
 	"github.com/transparency-dev/tessera"
-	"github.com/transparency-dev/tessera/storage/aws"
+	"github.com/transparency-dev/tessera/storage/objstore"
 	"golang.org/x/mod/sumdb/note"
 )
 
@@ -83,7 +83,7 @@ func main() {
 	// Create our Tessera storage backend, selecting GCS via the portable blob
 	// object store while keeping MySQL coordination (identical to the AWS backend).
 	cfg := storageConfigFromFlags()
-	driver, err := aws.New(ctx, cfg)
+	driver, err := objstore.New(ctx, cfg)
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to create new GCS storage", slog.Any("error", err))
 		os.Exit(1)
@@ -156,10 +156,10 @@ func main() {
 	}
 }
 
-// storageConfigFromFlags returns an aws.Config struct populated with values
+// storageConfigFromFlags returns an objstore.Config struct populated with values
 // provided via flags, configured to use the native GCS object store with MySQL
 // coordination.
-func storageConfigFromFlags() aws.Config {
+func storageConfigFromFlags() objstore.Config {
 	ctx := context.Background()
 	if *bucket == "" {
 		slog.ErrorContext(ctx, "--bucket must be set")
@@ -170,7 +170,7 @@ func storageConfigFromFlags() aws.Config {
 		os.Exit(1)
 	}
 
-	return aws.Config{
+	return objstore.Config{
 		// Select GCS via the portable gocloud.dev/blob object store. The gcsblob
 		// driver resolves credentials via ADC / Workload Identity, so no keys are
 		// configured here.

@@ -19,7 +19,7 @@ but here's a summary of the high level goals:
 *   [tlog-tiles API][] and storage
 *   Support for both cloud and on-premises infrastructure
     *   [GCP](./storage/gcp/)
-    *   [AWS](./storage/aws/)
+    *   [S3 / object store](./storage/objstore/)
     *   [POSIX](./storage/posix/)
 *   Make it easy to build and deploy new transparency logs on supported infrastructure
     *   Library instead of microservice architecture
@@ -158,7 +158,7 @@ Take a look at the example personalities in the `/cmd/` directory:
     - This example runs an HTTP web server that takes arbitrary data and adds it to a file-based log.
   - [gcp](./cmd/conformance/gcp/): example of operating a log running in GCP.
     - This example can be deployed via terraform, see the [deployment instructions](./deployment/live/gcp/conformance#manual-deployment).
-  - [aws](./cmd/conformance/aws/): example of operating a log running on AWS.
+  - [s3](./cmd/conformance/s3/): example of operating a log running on AWS or other S3-compatible object stores.
     - This example can be deployed via terraform, see the [deployment instructions](./deployment/live/aws/codelab#aws-codelab-deployment).
   - [posix-oneshot](./cmd/examples/posix-oneshot/): example of a command line tool to add entries to a log stored on the local filesystem
     - This example is not a long-lived process; running the command integrates entries into the log which lives only as files.
@@ -177,7 +177,7 @@ The code you write that calls Tessera is referred to as a personality, because i
 Before starting to write your own personality, it is strongly recommended that you have familiarized yourself with the provided personalities referenced in [Getting Started](#getting-started).
 When writing your Tessera personality, the first decision you need to make is which of the native drivers to use:
  *   [GCP](./storage/gcp/)
- *   [AWS](./storage/aws/)
+ *   [S3 / object store](./storage/objstore/)
  *   [POSIX](./storage/posix/)
 
 The easiest drivers to operate and to scale are the cloud implementations: GCP and AWS.
@@ -212,7 +212,7 @@ Import the main `tessera` package, and the driver for the storage backend you wa
 
 	// Choose one!
 	"github.com/transparency-dev/tessera/storage/posix"
-	// "github.com/transparency-dev/tessera/storage/aws"
+	// "github.com/transparency-dev/tessera/storage/objstore"
 	// "github.com/transparency-dev/tessera/storage/gcp"
 
 ```

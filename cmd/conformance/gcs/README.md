@@ -3,10 +3,10 @@
 This binary is a conformance/compliance/performance personality for
 **Google Cloud Storage with MySQL coordination**.
 
-It reuses the `storage/aws` backend's MySQL sequencing/integration code unchanged
+It reuses the `storage/objstore` backend's MySQL sequencing/integration code unchanged
 and selects GCS through the portable gocloud.dev/blob object store
-(`storage/aws/blob.go`) via `aws.Config{BlobURL: "gs://BUCKET"}`. In other words
-it is identical to [`cmd/conformance/aws`](../aws/) except the object store is
+(`storage/objstore/blob.go`) via `objstore.Config{BlobURL: "gs://BUCKET"}`. In other words
+it is identical to [`cmd/conformance/s3`](../s3/) except the object store is
 selected with a `gs://` bucket URL (gcsblob driver) instead of an `s3://` one.
 See [the design doc](/docs/design/cloud-agnostic-storage.md) for the rationale.
 

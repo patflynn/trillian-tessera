@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// aws is a simple personality allowing to run conformance/compliance/performance tests and showing how to use the Tessera AWS storage implementation.
+// s3 is a simple personality for running conformance/compliance/performance tests against any S3-compatible object store (Amazon S3, MinIO, ...) backed by MySQL coordination.
 package main
 
 import (
@@ -30,8 +30,8 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/transparency-dev/tessera"
-	"github.com/transparency-dev/tessera/storage/aws"
-	aws_as "github.com/transparency-dev/tessera/storage/aws/antispam"
+	"github.com/transparency-dev/tessera/storage/objstore"
+	antispamstore "github.com/transparency-dev/tessera/storage/objstore/antispam"
 	"golang.org/x/mod/sumdb/note"
 )
 
@@ -86,19 +86,19 @@ func main() {
 	s, a := signerFromFlags()
 
 	// Create our Tessera storage backend:
-	awsCfg := storageConfigFromFlags()
-	driver, err := aws.New(ctx, awsCfg)
+	cfg := storageConfigFromFlags()
+	driver, err := objstore.New(ctx, cfg)
 	if err != nil {
-		slog.ErrorContext(ctx, "Failed to create new AWS storage", slog.Any("error", err))
+		slog.ErrorContext(ctx, "Failed to create new storage", slog.Any("error", err))
 		os.Exit(1)
 	}
 	var antispam tessera.Antispam
 	// Persistent antispam is currently experimental, so there's no documentation yet!
 	if *antispamEnable {
-		asOpts := aws_as.AntispamOpts{} // Use defaults
-		antispam, err = aws_as.NewAntispam(ctx, antispamMysqlConfig().FormatDSN(), asOpts)
+		asOpts := antispamstore.AntispamOpts{} // Use defaults
+		antispam, err = antispamstore.NewAntispam(ctx, antispamMysqlConfig().FormatDSN(), asOpts)
 		if err != nil {
-			slog.ErrorContext(ctx, "Failed to create new AWS antispam storage", slog.Any("error", err))
+			slog.ErrorContext(ctx, "Failed to create new antispam storage", slog.Any("error", err))
 			os.Exit(1)
 		}
 	}
@@ -159,9 +159,9 @@ func main() {
 	}
 }
 
-// storageConfigFromFlags returns an aws.Config struct populated with values
+// storageConfigFromFlags returns an objstore.Config struct populated with values
 // provided via flags.
-func storageConfigFromFlags() aws.Config {
+func storageConfigFromFlags() objstore.Config {
 	ctx := context.Background()
 	// The object store is identified by a single blob URL. It can be provided
 	// explicitly via --blob_url, otherwise it's derived from --bucket and the
@@ -202,7 +202,7 @@ func storageConfigFromFlags() aws.Config {
 		AllowNativePasswords:    true,
 	}
 
-	return aws.Config{
+	return objstore.Config{
 		BlobURL:      blobURLFromFlags(ctx),
 		DSN:          c.FormatDSN(),
 		MaxOpenConns: *dbMaxConns,
