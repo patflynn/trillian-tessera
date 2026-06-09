@@ -34,3 +34,4 @@ go.work.sum
 
 # direnv (nix flake devShell cache)
 /.direnv/
+.claude/

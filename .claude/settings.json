@@ -1,6 +1,0 @@
-{
-  "statusLine": {
-    "command": "input=$(cat); cwd=$(echo \"$input\" | jq -r '.workspace.current_dir'); branch=$(git -C \"$cwd\" --no-optional-locks branch --show-current 2\u003e/dev/null); if [ -n \"$branch\" ]; then echo \"trillian-tessera ($branch)\"; else echo \"trillian-tessera\"; fi",
-    "type": "command"
-  }
-}
