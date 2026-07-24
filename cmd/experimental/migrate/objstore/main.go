@@ -12,8 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// aws-migrate is a command-line tool for migrating data from a tlog-tiles
-// compliant log, into a Tessera log instance hosted on AWS.
+// objstore-migrate migrates a tlog-tiles compliant log into a Tessera log
+// backed by any gocloud.dev/blob object store with MySQL coordination.
+//
+// The object store is selected by a single bucket URL via --blob_url (e.g.
+// gs://BUCKET, s3://BUCKET?endpoint=...&region=..., file:///path). When
+// --blob_url is unset, an s3:// URL is derived from --bucket and the
+// --s3_endpoint/--s3_access_key/--s3_secret flags.
+//
+// Coordination uses MySQL: the DSN is either --mysql_uri verbatim or assembled
+// from the --db_host/--db_port/--db_user/--db_password/--db_name flags.
 package main
 
 import (
@@ -25,18 +33,25 @@ import (
 
 	"log/slog"
 
-	aaws "github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/go-sql-driver/mysql"
 	"github.com/transparency-dev/tessera"
 	"github.com/transparency-dev/tessera/client"
+	"github.com/transparency-dev/tessera/cmd/internal/bloburl"
 	"github.com/transparency-dev/tessera/internal/parse"
-	"github.com/transparency-dev/tessera/storage/aws"
+	"github.com/transparency-dev/tessera/storage/objstore"
+	"gocloud.dev/blob"
+
+	// Register the blob drivers this binary supports; each binds its URL scheme
+	// (gs://, s3://, file://) on import. The library is driver-agnostic.
+	_ "gocloud.dev/blob/fileblob"
+	_ "gocloud.dev/blob/gcsblob"
+	_ "gocloud.dev/blob/s3blob"
 )
 
 var (
 	bucket            = flag.String("bucket", "", "Bucket to use for storing log")
+	blobURL           = flag.String("blob_url", "", "Optional explicit provider-scoped bucket URL for the object store, e.g. gs://BUCKET, s3://BUCKET?endpoint=...&s3ForcePathStyle=true&region=..., file:///path. If unset, a URL is derived from --bucket and the --s3_* flags. Auth is each driver's native credential chain.")
+	mysqlURI          = flag.String("mysql_uri", "", "Full MySQL DSN used for write coordination, e.g. 'user@tcp(127.0.0.1:3306)/db?parseTime=true'. If set, it is used directly; otherwise the DSN is built from the --db_* flags.")
 	dbName            = flag.String("db_name", "", "AuroraDB name")
 	dbHost            = flag.String("db_host", "", "AuroraDB host")
 	dbPort            = flag.Int("db_port", 3306, "AuroraDB port")
@@ -85,10 +100,15 @@ func main() {
 	}
 
 	// Create our Tessera storage backend:
-	awsCfg := storageConfigFromFlags()
-	driver, err := aws.New(ctx, awsCfg)
+	cfg := storageConfigFromFlags(ctx)
+	defer func() {
+		if err := cfg.Bucket.Close(); err != nil {
+			slog.WarnContext(ctx, "Failed to close blob bucket", slog.Any("error", err))
+		}
+	}()
+	driver, err := objstore.New(ctx, cfg)
 	if err != nil {
-		slog.ErrorContext(ctx, "Failed to create new AWS storage", slog.Any("error", err))
+		slog.ErrorContext(ctx, "Failed to create new storage", slog.Any("error", err))
 		os.Exit(1)
 	}
 	opts := tessera.NewMigrationOptions()
@@ -106,32 +126,57 @@ func main() {
 	}
 }
 
-// storageConfigFromFlags returns an aws.Config struct populated with values
-// provided via flags.
-func storageConfigFromFlags() aws.Config {
-	if *bucket == "" {
-		slog.ErrorContext(context.Background(), "--bucket must be set")
+// storageConfigFromFlags returns an objstore.Config populated from flags. The
+// caller must Close the returned Config's *blob.Bucket when done.
+func storageConfigFromFlags(ctx context.Context) objstore.Config {
+	if *blobURL == "" && *bucket == "" {
+		slog.ErrorContext(ctx, "either --bucket or --blob_url must be set")
 		os.Exit(1)
 	}
+
+	u := blobURLFromFlags(ctx)
+	bkt, err := blob.OpenBucket(ctx, u)
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to open blob bucket", slog.String("url", u), slog.Any("error", err))
+		os.Exit(1)
+	}
+
+	return objstore.Config{
+		Bucket:       bkt,
+		DSN:          dsnFromFlags(ctx),
+		MaxOpenConns: *dbMaxConns,
+		MaxIdleConns: *dbMaxIdle,
+	}
+}
+
+// dsnFromFlags returns the MySQL DSN used for write coordination.
+//
+// If --mysql_uri is set it is used verbatim (e.g. a Cloud SQL proxy connection).
+// Otherwise the DSN is assembled from the discrete --db_* flags.
+func dsnFromFlags(ctx context.Context) string {
+	if *mysqlURI != "" {
+		return *mysqlURI
+	}
+
 	if *dbName == "" {
-		slog.ErrorContext(context.Background(), "--db_name must be set")
+		slog.ErrorContext(ctx, "--db_name must be set (or pass --mysql_uri)")
 		os.Exit(1)
 	}
 	if *dbHost == "" {
-		slog.ErrorContext(context.Background(), "--db_host must be set")
+		slog.ErrorContext(ctx, "--db_host must be set (or pass --mysql_uri)")
 		os.Exit(1)
 	}
 	if *dbPort == 0 {
-		slog.ErrorContext(context.Background(), "--db_port must be set")
+		slog.ErrorContext(ctx, "--db_port must be set (or pass --mysql_uri)")
 		os.Exit(1)
 	}
 	if *dbUser == "" {
-		slog.ErrorContext(context.Background(), "--db_user must be set")
+		slog.ErrorContext(ctx, "--db_user must be set (or pass --mysql_uri)")
 		os.Exit(1)
 	}
-	// Empty passord isn't an option with AuroraDB MySQL.
+	// Empty password isn't an option with AuroraDB MySQL.
 	if *dbPassword == "" {
-		slog.ErrorContext(context.Background(), "--db_password must be set")
+		slog.ErrorContext(ctx, "--db_password must be set (or pass --mysql_uri)")
 		os.Exit(1)
 	}
 
@@ -144,30 +189,23 @@ func storageConfigFromFlags() aws.Config {
 		AllowCleartextPasswords: true,
 		AllowNativePasswords:    true,
 	}
+	return c.FormatDSN()
+}
 
-	// Configure to use MinIO Server
-	var awsConfig *aaws.Config
-	var s3Opts func(o *s3.Options)
-	if *s3Endpoint != "" {
-		const defaultRegion = "us-east-1"
-		s3Opts = func(o *s3.Options) {
-			o.BaseEndpoint = aaws.String(*s3Endpoint)
-			o.Credentials = credentials.NewStaticCredentialsProvider(*s3AccessKeyID, *s3SecretAccessKey, "")
-			o.Region = defaultRegion
-			o.UsePathStyle = true
-		}
-
-		awsConfig = &aaws.Config{
-			Region: defaultRegion,
-		}
+// blobURLFromFlags derives the gocloud.dev/blob bucket URL for the object store.
+//
+// --blob_url is used verbatim if set; otherwise an s3:// URL is built from
+// --bucket and the --s3_* flags via bloburl.DeriveS3, which also exports any
+// static credentials into the AWS SDK chain for the s3blob driver.
+func blobURLFromFlags(ctx context.Context) string {
+	if *blobURL != "" {
+		return *blobURL
 	}
 
-	return aws.Config{
-		Bucket:       *bucket,
-		SDKConfig:    awsConfig,
-		S3Options:    s3Opts,
-		DSN:          c.FormatDSN(),
-		MaxOpenConns: *dbMaxConns,
-		MaxIdleConns: *dbMaxIdle,
+	u, err := bloburl.DeriveS3(*bucket, *s3Endpoint, *s3AccessKeyID, *s3SecretAccessKey)
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to derive blob URL from --bucket/--s3_* flags", slog.Any("error", err))
+		os.Exit(1)
 	}
+	return u
 }

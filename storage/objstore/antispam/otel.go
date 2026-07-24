@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package aws
+package antispam
 
 import (
 	"go.opentelemetry.io/otel"
 )
 
-const name = "github.com/transparency-dev/tessera/storage/aws/antispam"
+const name = "github.com/transparency-dev/tessera/storage/objstore/antispam"
 
 var (
 	tracer = otel.Tracer(name)

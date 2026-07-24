@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package aws
+package objstore
 
 import (
 	"context"
@@ -24,7 +24,7 @@ import (
 	"go.opentelemetry.io/otel/metric"
 )
 
-const name = "github.com/transparency-dev/tessera/storage/aws"
+const name = "github.com/transparency-dev/tessera/storage/objstore"
 
 var (
 	meter  = otel.Meter(name)
