@@ -1,0 +1,141 @@
+# Tessera on a portable object store + MySQL
+
+This document describes the `storage/objstore` backend: a portable object-store
+implementation (via [`gocloud.dev/blob`](https://gocloud.dev/howto/blob/)) coordinated
+by MySQL. It is not AWS-specific — the same code serves any S3-compatible object store
+(Amazon S3, MinIO, …) as well as Google Cloud Storage, with write coordination handled
+by any MySQL-compatible database (e.g. Amazon Aurora). AWS (S3 + Aurora) is the primary
+tested and supported target, and the rest of this document describes that deployment.
+The generic [`cmd/conformance/objstore`](../../cmd/conformance/objstore/) binary
+exercises this backend against any provider (e.g. GCS via `--blob_url=gs://BUCKET`).
+
+## Library usage
+
+The application opens the bucket and passes it in, which keeps the choice of blob
+driver — and therefore which provider SDKs are compiled into your binary — in your
+hands. The driver must support `WriterOptions.IfNotExist` (the four below all do):
+
+```go
+import (
+	"gocloud.dev/blob"
+	"github.com/transparency-dev/tessera/storage/objstore"
+
+	// Import only the driver(s) you want; each registers its URL scheme.
+	_ "gocloud.dev/blob/gcsblob"  // gs://
+	_ "gocloud.dev/blob/s3blob"   // s3:// (AWS, MinIO, Ceph/RGW, R2)
+	_ "gocloud.dev/blob/fileblob" // file://
+	_ "gocloud.dev/blob/memblob"  // mem://
+)
+
+bkt, err := blob.OpenBucket(ctx, "gs://my-bucket")
+// handle err; defer bkt.Close() when the storage is no longer in use.
+
+driver, err := objstore.New(ctx, objstore.Config{
+	Bucket: bkt,
+	DSN:    "user:pass@tcp(host:3306)/dbname",
+})
+```
+
+Authentication is each driver's native credential chain (gcsblob via Application
+Default Credentials / Workload Identity; s3blob via the AWS SDK chain, including
+env vars and instance roles), so no static keys appear in code.
+
+## Overview
+
+This design takes advantage of an object store for long-term storage and low-cost, low-complexity serving of read traffic.
+It uses a MySQL-compatible database (e.g. Amazon Aurora) for coordinating writes.
+
+New entries flow in from the binary built with Tessera into transactional storage, where they're held
+temporarily to batch them up, and then assigned sequence numbers as each batch is flushed.
+This allows the `Add` API call to quickly return with *durably assigned* sequence numbers.
+
+From there, an async process derives the entry bundles and Merkle tree structure from the sequenced batches,
+writes these to the object store for serving, before finally removing integrated bundles from the transactional storage.
+
+Since entries are all sequenced by the time they're stored, and sequencing is done in "chunks", it's worth
+noting that all tree derivations are therefore idempotent.
+
+## Transactional storage
+
+The transactional storage is implemented with Aurora MySQL, and uses a schema with the following tables:
+   * `Tessera`: This table is used to identify the current schema version.
+   * `SeqCoord`: A table with a single row which is used to keep track of the next assignable sequence number.
+   * `Seq`: This holds batches of entries keyed by the sequence number assigned to the first entry in the batch.
+   * `IntCoord`: This table is used to coordinate integration of sequenced batches in the `Seq` table, and keeps
+               track of the current tree state.
+   * `PubCoord`: This table is used to coordinate publication of new checkpoints, ensuring that checkpoints
+               are not published more frequently than configured.
+   * `GCCoord`: This table is used to coordinate garbage collection of partial tiles and entry bundles which
+               have been made obsolete by the continued growth of the log.
+
+## Life of a leaf
+
+1. Leaves are submitted by the binary built using Tessera via a call the storage's `Add` func.
+1. The storage library batches these entries up, and, after a configurable period of time has elapsed
+   or the batch reaches a configurable size threshold, the batch is written to the `Seq` table which effectively
+   assigns a sequence numbers to the entries using the following algorithm:
+   In a transaction:
+   1. selects next from `SeqCoord` with for update ← this blocks other FE from writing their pools, but only for a short duration.
+   1. Inserts batch of entries into `Seq` with key `SeqCoord.next`
+   1. Update `SeqCoord` with `next+=len(batch)`
+1. Newly sequenced entries are periodically appended to the tree:
+   In a transaction:
+   1. select `seq` from `IntCoord` with for update ← this blocks other integrators from proceeding.
+   1. Select one or more consecutive batches from `Seq` for update, starting at `IntCoord.seq`
+   1. Write leaf bundles to the object store using batched entries
+   1. Integrate in Merkle tree and write tiles to the object store
+   1. Update checkpoint in the object store
+   1. Delete consumed batches from `Seq`
+   1. Update `IntCoord` with `seq+=num_entries_integrated` and the latest `rootHash`
+1. Checkpoints representing the latest state of the tree are published at the configured interval.
+
+## Antispam
+
+An experimental MySQL-backed implementation
+([`storage/objstore/antispam`](./antispam/)) stores the `<identity_hash>` -->
+`sequence` mapping in a MySQL-compatible database (e.g. Aurora MySQL). It works
+well, but calls for further stress testing and cost analysis.
+
+## Compatibility
+
+This storage implementation is provider-agnostic. The object store is any
+[`gocloud.dev/blob`](https://gocloud.dev/howto/blob/) driver that supports
+`WriterOptions.IfNotExist` — Google Cloud Storage (`gs://`), any S3-compatible
+store such as Amazon S3, MinIO, Ceph/RGW or Cloudflare R2 (`s3://`), the local
+filesystem (`file://`), and an in-memory store (`mem://`) all work — coordinated
+by any MySQL-compatible database (e.g. Amazon Aurora, Cloud SQL for MySQL).
+
+Multiple providers are exercised by dedicated CI lanes: GCS + Cloud SQL
+([`gcp_gcs_conformance.yml`](../../.github/workflows/gcp_gcs_conformance.yml)),
+MinIO ([`minio_conformance.yml`](../../.github/workflows/minio_conformance.yml)),
+and S3 + Aurora ([`aws_integration_test.yml`](../../.github/workflows/aws_integration_test.yml)),
+so support is not limited to any single vendor. Given the vast array of possible
+backend implementations and versions, a particular combination you rely on may
+not be covered by a CI lane; issues and PRs for additional providers are welcome
+provided they don't regress the tested targets, and there are folks who can help
+in the Transparency-Dev slack.
+
+### Alternatives considered
+
+Other transactional storage systems are available on AWS, e.g. Redshift, RDS or
+DynamoDB. Experiments were run using Aurora (MySQL, Serverless v2), RDS (MySQL),
+and DynamoDB.
+
+Aurora (MySQL) worked out to be a good compromise between cost, performance,
+operational overhead, code complexity, and so was selected.
+
+The alpha implementation was tested with entries of size 1KB each, at a write
+rate of 1500/s. This was done using the smallest possible Aurora instance
+available, `db.r5.large`, running `8.0.mysql_aurora.3.05.2`.
+
+Aurora (Serverless v2) worked out well, but seems less cost effective than
+provisioned Aurora for sustained traffic. For now, we decided not to explore this option further.
+
+RDS (MySQL) worked out well, but requires more administrative overhead than
+Aurora. For now, we decided not to explore this option further. 
+
+DynamoDB worked out to be less cost efficient than Aurora and RDS. It also has
+constraints that introduced a non trivial amount of complexity: max object size
+is 400KB,  max transaction size is {4MB OR 25 rows for write OR 100 rows for
+reads}, binary values must be base64 encoded, arrays of bytes are marshaled as
+sets by default (as of Dec. 2024). We decided not to explore this option further.

@@ -4,6 +4,12 @@ on:
   push:
     branches:
     - main
+  # PRs opt in via the 'run-aws-conformance' label or vars.AWS_CONFORMANCE_ENABLED
+  # == 'true'; 'labeled' lets adding the label trigger a run without a new push.
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
 
 # This prevents two workflows from running at the same time.
 # This workflows calls terragrunt, which does not allow concurrent runs.
@@ -28,6 +34,14 @@ env:
 jobs:
   aws-integration:
     runs-on: ubuntu-latest
+    # push/dispatch always run; pull_request runs only when opted in (label or
+    # repo var) to avoid spinning up real AWS infra on unrelated PRs.
+    if: >-
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+        (contains(github.event.pull_request.labels.*.name, 'run-aws-conformance') ||
+         vars.AWS_CONFORMANCE_ENABLED == 'true'))
 
     steps:
       - name: Configure AWS credentials
@@ -55,7 +69,7 @@ jobs:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           ECR_REPOSITORY: ${{ env.ECR_REPOSITORY_CONFORMANCE }}
         run: |
-          docker build -f ./cmd/conformance/aws/Dockerfile . -t "$ECR_REGISTRY/$ECR_REPOSITORY"
+          docker build -f ./cmd/conformance/objstore/Dockerfile . -t "$ECR_REGISTRY/$ECR_REPOSITORY"
           docker push "$ECR_REGISTRY/$ECR_REPOSITORY"
           echo "Pushed image to $ECR_REGISTRY/$ECR_REPOSITORY"
 
