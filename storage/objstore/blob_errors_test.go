@@ -45,7 +45,7 @@ func newFakeS3(t *testing.T, status int, code, requestID string) string {
 		w.Header().Set("x-amz-request-id", requestID)
 		w.Header().Set("x-amz-id-2", "ZXhhbXBsZUhvc3RJRGV4YW1wbGVIb3N0SUQ=")
 		w.WriteHeader(status)
-		fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?><Error><Code>%s</Code><Message>injected by newFakeS3</Message><RequestId>%s</RequestId></Error>`, code, requestID)
+		_, _ = fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?><Error><Code>%s</Code><Message>injected by newFakeS3</Message><RequestId>%s</RequestId></Error>`, code, requestID)
 	}))
 	t.Cleanup(srv.Close)
 
