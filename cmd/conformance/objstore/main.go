@@ -1,0 +1,330 @@
+// Copyright 2024 The Tessera authors. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// objstore is a conformance personality for any gocloud.dev/blob object store
+// with MySQL coordination.
+//
+// The object store is selected by a single bucket URL via --blob_url (e.g.
+// gs://BUCKET, s3://BUCKET?endpoint=...&region=..., mem://). When --blob_url is
+// unset, an s3:// URL is derived from --bucket and the
+// --s3_endpoint/--s3_access_key/--s3_secret flags.
+//
+// Coordination uses MySQL: the DSN is either --mysql_uri verbatim or assembled
+// from the --db_host/--db_port/--db_user/--db_password/--db_name flags.
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"time"
+
+	"log/slog"
+
+	"github.com/go-sql-driver/mysql"
+	"github.com/transparency-dev/tessera"
+	"github.com/transparency-dev/tessera/cmd/internal/bloburl"
+	"github.com/transparency-dev/tessera/storage/objstore"
+	antispamstore "github.com/transparency-dev/tessera/storage/objstore/antispam"
+	"gocloud.dev/blob"
+	"golang.org/x/mod/sumdb/note"
+
+	// Register the blob drivers this binary supports; each binds its URL scheme
+	// (gs://, s3://, mem://) on import. fileblob is deliberately absent: its
+	// IfNotExist is not atomic, so it cannot safely back a log. See
+	// storage/objstore/blob.go.
+	_ "gocloud.dev/blob/gcsblob"
+	_ "gocloud.dev/blob/memblob"
+	_ "gocloud.dev/blob/s3blob"
+)
+
+var (
+	bucket            = flag.String("bucket", "", "Bucket to use for storing log")
+	bucketPrefix      = flag.String("bucket_prefix", "", "Optional prefix to prepend to all log resource paths in the bucket")
+	mysqlURI          = flag.String("mysql_uri", "", "Full MySQL DSN used for write coordination, e.g. 'user@tcp(127.0.0.1:3306)/db?parseTime=true'. If set, it is used directly; otherwise the DSN is built from the --db_* flags.")
+	dbName            = flag.String("db_name", "", "AuroraDB name for the log DB")
+	dbHost            = flag.String("db_host", "", "AuroraDB host")
+	dbPort            = flag.Int("db_port", 3306, "AuroraDB port")
+	dbUser            = flag.String("db_user", "", "AuroraDB user")
+	dbPassword        = flag.String("db_password", "", "AuroraDB user")
+	dbMaxConns        = flag.Int("db_max_conns", 0, "Maximum connections to the database, defaults to 0, i.e unlimited")
+	dbMaxIdle         = flag.Int("db_max_idle_conns", 2, "Maximum idle database connections in the connection pool, defaults to 2")
+	s3Endpoint        = flag.String("s3_endpoint", "", "Endpoint for custom non-AWS S3 service")
+	s3AccessKeyID     = flag.String("s3_access_key", "", "Access key ID for custom non-AWS S3 service")
+	s3SecretAccessKey = flag.String("s3_secret", "", "Secret access key for custom non-AWS S3 service")
+
+	blobURL = flag.String("blob_url", "", "Optional explicit provider-scoped bucket URL for the object store, e.g. gs://BUCKET, s3://BUCKET?endpoint=...&s3ForcePathStyle=true&region=..., mem://. If unset, a URL is derived from --bucket and the --s3_* flags. Auth is each driver's native credential chain. file:// is not supported: fileblob's create-if-absent is not atomic.")
+
+	listen            = flag.String("listen", ":2024", "Address:port to listen on")
+	signer            = flag.String("signer", "", "Note signer to use to sign checkpoints")
+	publishInterval   = flag.Duration("publish_interval", 3*time.Second, "How frequently to publish updated checkpoints")
+	traceFraction     = flag.Float64("trace_fraction", 0, "Fraction of open-telemetry span traces to sample")
+	slogLevel         = flag.Int("slog_level", 0, "The cut-off threshold for structured logging. Default is 0 (INFO). See https://pkg.go.dev/log/slog#Level for other levels.")
+	logFormat         = flag.String("log_format", "text", "The format of the logs: text or json.")
+	additionalSigners = []string{}
+
+	antispamEnable = flag.Bool("antispam", false, "EXPERIMENTAL: Set to true to enable persistent antispam storage")
+	antispamDb     = flag.String("antispam_db_name", "", "AuroraDB name for the antispam DB")
+)
+
+func init() {
+	flag.Func("additional_signer", "Additional note signer for checkpoints, may be specified multiple times", func(s string) error {
+		additionalSigners = append(additionalSigners, s)
+		return nil
+	})
+}
+
+func main() {
+	flag.Parse()
+	ctx := context.Background()
+	var handler slog.Handler
+	switch *logFormat {
+	case "json":
+		handler = slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.Level(*slogLevel)})
+	default:
+		handler = slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.Level(*slogLevel)})
+	}
+	slog.SetDefault(slog.New(handler))
+
+	shutdownOTel := initOTel(ctx, *traceFraction)
+	defer shutdownOTel(ctx)
+	s, a := signerFromFlags()
+
+	// Create our Tessera storage backend:
+	cfg := storageConfigFromFlags(ctx)
+	defer func() {
+		if err := cfg.Bucket.Close(); err != nil {
+			slog.WarnContext(ctx, "Failed to close blob bucket", slog.Any("error", err))
+		}
+	}()
+	driver, err := objstore.New(ctx, cfg)
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to create new storage", slog.Any("error", err))
+		os.Exit(1)
+	}
+	var antispam tessera.Antispam
+	// Persistent antispam is currently experimental, so there's no documentation yet!
+	if *antispamEnable {
+		asOpts := antispamstore.AntispamOpts{} // Use defaults
+		antispam, err = antispamstore.NewAntispam(ctx, antispamMysqlConfig().FormatDSN(), asOpts)
+		if err != nil {
+			slog.ErrorContext(ctx, "Failed to create new antispam storage", slog.Any("error", err))
+			os.Exit(1)
+		}
+	}
+	appender, shutdown, _, err := tessera.NewAppender(ctx, driver, tessera.NewAppendOptions().
+		WithCheckpointSigner(s, a...).
+		WithCheckpointInterval(*publishInterval).
+		WithBatching(512, 300*time.Millisecond).
+		WithPushback(10*4096).
+		WithAntispam(tessera.DefaultAntispamInMemorySize, antispam))
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to create new appender", slog.Any("error", err))
+		os.Exit(1)
+	}
+
+	// Expose a HTTP handler for the conformance test writes.
+	// This should accept arbitrary bytes POSTed to /add, and return an ascii
+	// decimal representation of the index assigned to the entry.
+	http.HandleFunc("POST /add", func(w http.ResponseWriter, r *http.Request) {
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		idx, err := appender.Add(r.Context(), tessera.NewEntry(b))()
+		if err != nil {
+			if errors.Is(err, tessera.ErrPushback) {
+				w.Header().Add("Retry-After", "1")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(err.Error()))
+			return
+		}
+		// Write out the assigned index
+		_, _ = fmt.Fprintf(w, "%d", idx.Index)
+	})
+
+	var protocols http.Protocols
+	protocols.SetHTTP1(true)
+	protocols.SetUnencryptedHTTP2(true)
+
+	server := &http.Server{
+		Addr:              *listen,
+		Handler:           http.DefaultServeMux,
+		Protocols:         &protocols,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	if err := server.ListenAndServe(); err != nil {
+		if err := shutdown(ctx); err != nil {
+			slog.ErrorContext(ctx, "Failed to cleanly shutdown after ListenAndServe", slog.Any("error", err))
+			os.Exit(1)
+		}
+		slog.ErrorContext(ctx, "ListenAndServe", slog.Any("error", err))
+		os.Exit(1)
+	}
+}
+
+// storageConfigFromFlags returns an objstore.Config populated from flags. Its
+// *blob.Bucket stays open for the process lifetime.
+func storageConfigFromFlags(ctx context.Context) objstore.Config {
+	// --bucket is only required when --blob_url is unset.
+	if *blobURL == "" && *bucket == "" {
+		slog.ErrorContext(ctx, "either --bucket or --blob_url must be set")
+		os.Exit(1)
+	}
+
+	u := blobURLFromFlags(ctx)
+	bkt, err := blob.OpenBucket(ctx, u)
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to open blob bucket", slog.String("url", u), slog.Any("error", err))
+		os.Exit(1)
+	}
+
+	return objstore.Config{
+		Bucket:       bkt,
+		BucketPrefix: *bucketPrefix,
+		DSN:          dsnFromFlags(ctx),
+		MaxOpenConns: *dbMaxConns,
+		MaxIdleConns: *dbMaxIdle,
+	}
+}
+
+// dsnFromFlags returns the MySQL DSN used for write coordination.
+//
+// If --mysql_uri is set it is used verbatim (e.g. a Cloud SQL proxy connection).
+// Otherwise the DSN is assembled from the discrete --db_* flags.
+func dsnFromFlags(ctx context.Context) string {
+	if *mysqlURI != "" {
+		return *mysqlURI
+	}
+
+	if *dbName == "" {
+		slog.ErrorContext(ctx, "--db_name must be set (or pass --mysql_uri)")
+		os.Exit(1)
+	}
+	if *dbHost == "" {
+		slog.ErrorContext(ctx, "--db_host must be set (or pass --mysql_uri)")
+		os.Exit(1)
+	}
+	if *dbPort == 0 {
+		slog.ErrorContext(ctx, "--db_port must be set (or pass --mysql_uri)")
+		os.Exit(1)
+	}
+	if *dbPort < 1 || *dbPort > 65535 {
+		slog.ErrorContext(ctx, "--db_port must be a valid port number between 1 and 65535")
+		os.Exit(1)
+	}
+	if *dbUser == "" {
+		slog.ErrorContext(ctx, "--db_user must be set (or pass --mysql_uri)")
+		os.Exit(1)
+	}
+	// Empty password isn't an option with AuroraDB MySQL.
+	if *dbPassword == "" {
+		slog.ErrorContext(ctx, "--db_password must be set (or pass --mysql_uri)")
+		os.Exit(1)
+	}
+
+	c := mysql.Config{
+		User:                    *dbUser,
+		Passwd:                  *dbPassword,
+		Net:                     "tcp",
+		Addr:                    fmt.Sprintf("%s:%d", *dbHost, *dbPort),
+		DBName:                  *dbName,
+		AllowCleartextPasswords: true,
+		AllowNativePasswords:    true,
+	}
+	return c.FormatDSN()
+}
+
+// blobURLFromFlags derives the gocloud.dev/blob bucket URL for the object store.
+//
+// --blob_url is used verbatim if set; otherwise an s3:// URL is built from
+// --bucket and the --s3_* flags via bloburl.DeriveS3, which also exports any
+// static credentials into the AWS SDK chain for the s3blob driver.
+func blobURLFromFlags(ctx context.Context) string {
+	if *blobURL != "" {
+		return *blobURL
+	}
+
+	u, err := bloburl.DeriveS3(*bucket, *s3Endpoint, *s3AccessKeyID, *s3SecretAccessKey)
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to derive blob URL from --bucket/--s3_* flags", slog.Any("error", err))
+		os.Exit(1)
+	}
+	return u
+}
+
+func antispamMysqlConfig() *mysql.Config {
+	ctx := context.Background()
+	if *antispamDb == "" {
+		slog.ErrorContext(ctx, "--antispam_db_name must be set")
+		os.Exit(1)
+	}
+	if *dbHost == "" {
+		slog.ErrorContext(ctx, "--db_host must be set")
+		os.Exit(1)
+	}
+	if *dbPort == 0 {
+		slog.ErrorContext(ctx, "--db_port must be set")
+		os.Exit(1)
+	}
+	if *dbUser == "" {
+		slog.ErrorContext(ctx, "--db_user must be set")
+		os.Exit(1)
+	}
+	// Empty password isn't an option with AuroraDB MySQL.
+	if *dbPassword == "" {
+		slog.ErrorContext(ctx, "--db_password must be set")
+		os.Exit(1)
+	}
+
+	return &mysql.Config{
+		User:                    *dbUser,
+		Passwd:                  *dbPassword,
+		Net:                     "tcp",
+		Addr:                    fmt.Sprintf("%s:%d", *dbHost, *dbPort),
+		DBName:                  *antispamDb,
+		AllowCleartextPasswords: true,
+		AllowNativePasswords:    true,
+	}
+}
+
+func signerFromFlags() (note.Signer, []note.Signer) {
+	s, err := note.NewSigner(*signer)
+	if err != nil {
+		slog.ErrorContext(context.Background(), "Failed to create new signer", slog.Any("error", err))
+		os.Exit(1)
+	}
+
+	var a []note.Signer
+	for _, as := range additionalSigners {
+		s, err := note.NewSigner(as)
+		if err != nil {
+			slog.ErrorContext(context.Background(), "Failed to create additional signer", slog.Any("error", err))
+			os.Exit(1)
+		}
+		a = append(a, s)
+	}
+
+	return s, a
+}
