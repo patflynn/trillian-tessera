@@ -16,8 +16,8 @@
 // with MySQL coordination.
 //
 // The object store is selected by a single bucket URL via --blob_url (e.g.
-// gs://BUCKET, s3://BUCKET?endpoint=...&region=..., file:///path, mem://). When
-// --blob_url is unset, an s3:// URL is derived from --bucket and the
+// gs://BUCKET, s3://BUCKET?endpoint=...&region=..., mem://). When --blob_url is
+// unset, an s3:// URL is derived from --bucket and the
 // --s3_endpoint/--s3_access_key/--s3_secret flags.
 //
 // Coordination uses MySQL: the DSN is either --mysql_uri verbatim or assembled
@@ -45,8 +45,9 @@ import (
 	"golang.org/x/mod/sumdb/note"
 
 	// Register the blob drivers this binary supports; each binds its URL scheme
-	// (gs://, s3://, file://, mem://) on import. The library is driver-agnostic.
-	_ "gocloud.dev/blob/fileblob"
+	// (gs://, s3://, mem://) on import. fileblob is deliberately absent: its
+	// IfNotExist is not atomic, so it cannot safely back a log. See
+	// storage/objstore/blob.go.
 	_ "gocloud.dev/blob/gcsblob"
 	_ "gocloud.dev/blob/memblob"
 	_ "gocloud.dev/blob/s3blob"
@@ -67,7 +68,7 @@ var (
 	s3AccessKeyID     = flag.String("s3_access_key", "", "Access key ID for custom non-AWS S3 service")
 	s3SecretAccessKey = flag.String("s3_secret", "", "Secret access key for custom non-AWS S3 service")
 
-	blobURL = flag.String("blob_url", "", "Optional explicit provider-scoped bucket URL for the object store, e.g. gs://BUCKET, s3://BUCKET?endpoint=...&s3ForcePathStyle=true&region=..., file:///path, mem://. If unset, a URL is derived from --bucket and the --s3_* flags. Auth is each driver's native credential chain.")
+	blobURL = flag.String("blob_url", "", "Optional explicit provider-scoped bucket URL for the object store, e.g. gs://BUCKET, s3://BUCKET?endpoint=...&s3ForcePathStyle=true&region=..., mem://. If unset, a URL is derived from --bucket and the --s3_* flags. Auth is each driver's native credential chain. file:// is not supported: fileblob's create-if-absent is not atomic.")
 
 	listen            = flag.String("listen", ":2024", "Address:port to listen on")
 	signer            = flag.String("signer", "", "Note signer to use to sign checkpoints")

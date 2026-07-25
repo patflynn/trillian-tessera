@@ -16,8 +16,8 @@
 // backed by any gocloud.dev/blob object store with MySQL coordination.
 //
 // The object store is selected by a single bucket URL via --blob_url (e.g.
-// gs://BUCKET, s3://BUCKET?endpoint=...&region=..., file:///path). When
-// --blob_url is unset, an s3:// URL is derived from --bucket and the
+// gs://BUCKET, s3://BUCKET?endpoint=...&region=...). When --blob_url is unset,
+// an s3:// URL is derived from --bucket and the
 // --s3_endpoint/--s3_access_key/--s3_secret flags.
 //
 // Coordination uses MySQL: the DSN is either --mysql_uri verbatim or assembled
@@ -42,15 +42,16 @@ import (
 	"gocloud.dev/blob"
 
 	// Register the blob drivers this binary supports; each binds its URL scheme
-	// (gs://, s3://, file://) on import. The library is driver-agnostic.
-	_ "gocloud.dev/blob/fileblob"
+	// (gs://, s3://) on import. fileblob is deliberately absent: its IfNotExist
+	// is not atomic, so it cannot safely back a log. See
+	// storage/objstore/blob.go.
 	_ "gocloud.dev/blob/gcsblob"
 	_ "gocloud.dev/blob/s3blob"
 )
 
 var (
 	bucket            = flag.String("bucket", "", "Bucket to use for storing log")
-	blobURL           = flag.String("blob_url", "", "Optional explicit provider-scoped bucket URL for the object store, e.g. gs://BUCKET, s3://BUCKET?endpoint=...&s3ForcePathStyle=true&region=..., file:///path. If unset, a URL is derived from --bucket and the --s3_* flags. Auth is each driver's native credential chain.")
+	blobURL           = flag.String("blob_url", "", "Optional explicit provider-scoped bucket URL for the object store, e.g. gs://BUCKET, s3://BUCKET?endpoint=...&s3ForcePathStyle=true&region=.... If unset, a URL is derived from --bucket and the --s3_* flags. Auth is each driver's native credential chain. file:// is not supported: fileblob's create-if-absent is not atomic.")
 	mysqlURI          = flag.String("mysql_uri", "", "Full MySQL DSN used for write coordination, e.g. 'user@tcp(127.0.0.1:3306)/db?parseTime=true'. If set, it is used directly; otherwise the DSN is built from the --db_* flags.")
 	dbName            = flag.String("db_name", "", "AuroraDB name")
 	dbHost            = flag.String("db_host", "", "AuroraDB host")

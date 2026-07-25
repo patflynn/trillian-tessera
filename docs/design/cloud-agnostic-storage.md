@@ -131,9 +131,13 @@ The `objStore` interface is the portability seam. Three ways to fill it; we reco
   the `cloud.google.com/go/storage` dependency to that build.
 
 ### Option B — Unify on `gocloud.dev/blob` (evaluate next; the run-anywhere endgame)
-- One `objStore` impl over `*blob.Bucket`; pick driver by URL (`gs://`, `s3://`, `file://`, `mem://`).
+- One `objStore` impl over `*blob.Bucket`; pick driver by URL (`gs://`, `s3://`, `mem://`).
   `WriterOptions.IfNotExist` gives the create-if-absent primitive uniformly; auth is each driver's
   native chain (gcsblob → ADC/WIF; s3blob → SDK chain incl. STS/HMAC).
+  **Spike outcome:** `IfNotExist` is *not* uniform. gcsblob and s3blob delegate it to the server and
+  are safe; memblob is safe in-process. fileblob implements it as an unsynchronised stat-then-rename
+  and lets concurrent writers overwrite one another silently, so `file://` was dropped. Error
+  semantics did *not* pass through cleanly either — see `isNotFound` in `storage/objstore/blob.go`.
 - **Upside:** genuinely one implementation for GCS + AWS + MinIO + Ceph + R2 + local; Google-maintained.
 - **Must verify before adopting (spike):** that `IfNotExist` is honored by **s3blob against MinIO/R2/Ceph**
   and by **gcsblob**, and that error semantics + cache-control/content-type pass through. The Go CDK

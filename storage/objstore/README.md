@@ -12,8 +12,21 @@ exercises this backend against any provider (e.g. GCS via `--blob_url=gs://BUCKE
 ## Library usage
 
 The application opens the bucket and passes it in, which keeps the choice of blob
-driver — and therefore which provider SDKs are compiled into your binary — in your
-hands. The driver must support `WriterOptions.IfNotExist` (the four below all do):
+driver in your hands.
+
+The driver must implement `WriterOptions.IfNotExist` as a genuinely **atomic**
+create-if-absent, because that is the only thing preventing two concurrent
+integrators from writing different tiles to the same coordinate and forking the
+log. Only `gcsblob` and `s3blob` qualify: both delegate the check to the server
+(`x-goog-if-generation-match` and `If-None-Match` respectively), which arbitrates
+it. `memblob` is atomic within a single process and is suitable for tests.
+
+> **`fileblob` is not supported.** It implements `IfNotExist` as an `os.Stat`
+> followed by an `os.Rename`, guarded by a mutex allocated per writer — which
+> therefore serialises nothing, even inside one process — and POSIX rename
+> replaces the destination silently. Concurrent writers all "succeed", no error
+> is returned to any of them, and an arbitrary one of the payloads survives.
+> Do not use it with more than one writer.
 
 ```go
 import (
@@ -21,10 +34,9 @@ import (
 	"github.com/transparency-dev/tessera/storage/objstore"
 
 	// Import only the driver(s) you want; each registers its URL scheme.
-	_ "gocloud.dev/blob/gcsblob"  // gs://
-	_ "gocloud.dev/blob/s3blob"   // s3:// (AWS, MinIO, Ceph/RGW, R2)
-	_ "gocloud.dev/blob/fileblob" // file://
-	_ "gocloud.dev/blob/memblob"  // mem://
+	_ "gocloud.dev/blob/gcsblob" // gs://
+	_ "gocloud.dev/blob/s3blob"  // s3:// (AWS, MinIO, Ceph/RGW, R2)
+	_ "gocloud.dev/blob/memblob" // mem:// (tests only)
 )
 
 bkt, err := blob.OpenBucket(ctx, "gs://my-bucket")
@@ -39,6 +51,11 @@ driver, err := objstore.New(ctx, objstore.Config{
 Authentication is each driver's native credential chain (gcsblob via Application
 Default Credentials / Workload Identity; s3blob via the AWS SDK chain, including
 env vars and instance roles), so no static keys appear in code.
+
+Note that importing this package links in both the GCS and S3 SDKs regardless of
+which driver you register, because classifying "object not found" correctly
+requires their typed errors — see the `isNotFound` comment in
+[`blob.go`](./blob.go).
 
 ## Overview
 
@@ -99,11 +116,13 @@ well, but calls for further stress testing and cost analysis.
 ## Compatibility
 
 This storage implementation is provider-agnostic. The object store is any
-[`gocloud.dev/blob`](https://gocloud.dev/howto/blob/) driver that supports
-`WriterOptions.IfNotExist` — Google Cloud Storage (`gs://`), any S3-compatible
-store such as Amazon S3, MinIO, Ceph/RGW or Cloudflare R2 (`s3://`), the local
-filesystem (`file://`), and an in-memory store (`mem://`) all work — coordinated
-by any MySQL-compatible database (e.g. Amazon Aurora, Cloud SQL for MySQL).
+[`gocloud.dev/blob`](https://gocloud.dev/howto/blob/) driver providing a
+server-side atomic create-if-absent via `WriterOptions.IfNotExist` — Google Cloud
+Storage (`gs://`) and any S3-compatible store such as Amazon S3, MinIO, Ceph/RGW
+or Cloudflare R2 (`s3://`) — coordinated by any MySQL-compatible database
+(e.g. Amazon Aurora, Cloud SQL for MySQL). The in-memory store (`mem://`) is
+atomic within a process and is used by the tests. The local filesystem
+(`file://`) is **not** supported: see the warning above.
 
 Multiple providers are exercised by dedicated CI lanes: GCS + Cloud SQL
 ([`gcp_gcs_conformance.yml`](../../.github/workflows/gcp_gcs_conformance.yml)),

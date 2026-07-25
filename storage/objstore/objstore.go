@@ -137,9 +137,16 @@ type consumeFunc func(ctx context.Context, from uint64, entries []storage.Sequen
 // Config holds project and resource configuration for a storage instance.
 type Config struct {
 	// Bucket is the open gocloud.dev/blob bucket backing the object store.
-	// Its driver must support WriterOptions.IfNotExist, which this storage relies
-	// on for safe concurrent integration. The caller opens and owns the bucket,
-	// and must keep it open for the storage's lifetime and Close it afterwards.
+	//
+	// Its driver must implement WriterOptions.IfNotExist as a genuinely atomic
+	// create-if-absent, which this storage relies on for safe concurrent
+	// integration: gcsblob and s3blob both delegate the check to the server, and
+	// memblob arbitrates it in-process for tests. fileblob does NOT qualify — its
+	// implementation is an unsynchronised stat-then-rename, so concurrent writers
+	// silently overwrite one another. See blob.go for details.
+	//
+	// The caller opens and owns the bucket, and must keep it open for the
+	// storage's lifetime and Close it afterwards.
 	Bucket *blob.Bucket
 	// BucketPrefix is an optional prefix to prepend to all log resource paths.
 	// This can be used e.g. to store multiple logs in the same bucket.

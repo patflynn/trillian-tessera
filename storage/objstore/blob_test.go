@@ -18,10 +18,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"slices"
 	"sort"
+	"sync"
 	"testing"
 
 	"gocloud.dev/blob"
@@ -31,14 +33,30 @@ import (
 	_ "gocloud.dev/blob/memblob"
 )
 
-// blobURLs returns the in-process blob driver URLs to exercise. memblob and
-// fileblob both honor WriterOptions.IfNotExist (needed by setObjectIfNoneMatch)
-// and are fully hermetic.
+// blobURLs returns the hermetic in-process blob driver URLs to exercise with
+// tests that do not depend on create-if-absent being atomic. fileblob is
+// included here and only here: it is fine for plain reads and writes, but its
+// WriterOptions.IfNotExist is an unsynchronised stat-then-rename that lets
+// concurrent writers overwrite one another (see the comment in blob.go), so it
+// must not be used to claim conditional-write coverage.
 func blobURLs(t *testing.T) map[string]string {
 	t.Helper()
 	return map[string]string{
 		"mem":  "mem://",
 		"file": "file://" + t.TempDir(),
+	}
+}
+
+// atomicBlobURLs returns the in-process blob driver URLs whose
+// WriterOptions.IfNotExist really is an atomic create-if-absent, and which may
+// therefore be used to exercise setObjectIfNoneMatch. memblob arbitrates every
+// write under one bucket-wide lock, matching what gcsblob and s3blob get from
+// the server; those two are covered by the conformance CI lanes rather than
+// here, since they need a real backend.
+func atomicBlobURLs(t *testing.T) map[string]string {
+	t.Helper()
+	return map[string]string{
+		"mem": "mem://",
 	}
 }
 
@@ -95,7 +113,7 @@ func TestBlobGetObjectNotFound(t *testing.T) {
 
 func TestBlobSetObjectIfNoneMatch(t *testing.T) {
 	ctx := context.Background()
-	for name, rawURL := range blobURLs(t) {
+	for name, rawURL := range atomicBlobURLs(t) {
 		t.Run(name, func(t *testing.T) {
 			s := newTestBlobStore(t, rawURL, "")
 
@@ -123,6 +141,70 @@ func TestBlobSetObjectIfNoneMatch(t *testing.T) {
 			}
 			if !bytes.Equal(got, data) {
 				t.Errorf("object content = %q, want unchanged %q", got, data)
+			}
+		})
+	}
+}
+
+// TestBlobSetObjectIfNoneMatchConcurrent is the test that actually decides
+// whether a driver may back this storage. setObjectIfNoneMatch is the only
+// thing stopping two integrators from writing different tiles to the same
+// coordinate and forking the log, so "exactly one writer wins" has to hold
+// under real contention, not just when the calls happen to be sequential.
+//
+// Every writer offers distinct bytes, so a driver that silently ignores the
+// precondition cannot pass by accident: it will either report more than one
+// success or leave behind bytes that no successful writer wrote. Pointing this
+// at fileblob reports several simultaneous winners, which is why fileblob is
+// not in atomicBlobURLs.
+func TestBlobSetObjectIfNoneMatchConcurrent(t *testing.T) {
+	ctx := context.Background()
+	const (
+		writers = 32
+		key     = "cond/contended-object"
+	)
+
+	for name, rawURL := range atomicBlobURLs(t) {
+		t.Run(name, func(t *testing.T) {
+			s := newTestBlobStore(t, rawURL, "")
+
+			payloads := make([][]byte, writers)
+			for i := range payloads {
+				payloads[i] = []byte(fmt.Sprintf("payload written by writer %02d", i))
+			}
+
+			errs := make([]error, writers)
+			start := make(chan struct{})
+			wg := sync.WaitGroup{}
+			for i := range writers {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					<-start // Line all the writers up so they collide.
+					errs[i] = s.setObjectIfNoneMatch(ctx, key, payloads[i], "text/plain", "no-cache")
+				}()
+			}
+			close(start)
+			wg.Wait()
+
+			var winners []int
+			for i, err := range errs {
+				if err == nil {
+					winners = append(winners, i)
+				}
+			}
+			if len(winners) != 1 {
+				t.Fatalf("setObjectIfNoneMatch succeeded for %d of %d concurrent writers (%v), want exactly 1: the driver is not honouring IfNotExist atomically", len(winners), writers, winners)
+			}
+
+			// The bytes left in the store must be the winner's, not some other
+			// writer's that overwrote them after losing.
+			got, err := s.getObject(ctx, key)
+			if err != nil {
+				t.Fatalf("getObject: %v", err)
+			}
+			if want := payloads[winners[0]]; !bytes.Equal(got, want) {
+				t.Errorf("stored content = %q, want the winning writer's %q", got, want)
 			}
 		})
 	}

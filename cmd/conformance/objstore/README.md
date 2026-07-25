@@ -11,7 +11,9 @@ same binary serves every provider:
   `--blob_url=s3://BUCKET?endpoint=...&region=...&s3ForcePathStyle=true`, or use the
   convenience flags `--bucket` plus `--s3_endpoint`/`--s3_access_key`/`--s3_secret`
   to derive an `s3://` URL automatically.
-- **Local/testing:** `--blob_url=file:///path` or `--blob_url=mem://`.
+- **Local/testing:** `--blob_url=mem://`. Note that `file://` is *not* supported:
+  fileblob's create-if-absent is not atomic, so concurrent writers silently
+  overwrite one another. The driver is not registered by this binary.
 
 Write coordination always uses MySQL. Supply the DSN either directly with
 `--mysql_uri` (e.g. pointing at a Cloud SQL Auth Proxy) or via the discrete
