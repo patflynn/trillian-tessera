@@ -1,0 +1,207 @@
+name: MinIO Conformance
+
+# Fully-hermetic conformance lane: runs cmd/conformance/aws (the existing AWS
+# personality, backed by storage/aws) against a self-hosted S3-compatible stack --
+# MinIO for object storage, MySQL for write coordination -- entirely on the runner.
+#
+# No cloud account, no secrets, no repository variables, no OIDC: the MinIO and
+# MySQL credentials are throwaway values defined inline, and every dependency
+# (MinIO, MySQL, the conformance server, the hammer) lives and dies with the
+# runner. That means this lane runs unconditionally on every pull request,
+# including pull requests from forks.
+#
+# This works with no changes to the Go code: cmd/conformance/aws already accepts
+# --s3_endpoint, --s3_access_key and --s3_secret, and when --s3_endpoint is set it
+# configures the S3 client with a custom BaseEndpoint, static credentials and
+# UsePathStyle=true under a "// Configure to use MinIO Server" comment
+# (cmd/conformance/aws/main.go).
+#
+# See https://github.com/transparency-dev/tessera/issues/845 for context: the AWS
+# backend is believed to work against alternative S3+MySQL combinations, but until
+# now nothing in CI proved it.
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Per-PR group (github.ref) so distinct PRs don't cancel each other. The lane is
+  # fully hermetic (no shared external state), so PRs can run it concurrently.
+  group: minio-conformance-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Throwaway, local-only credentials; they never leave the runner.
+  MINIO_ROOT_USER: minioadmin
+  MINIO_ROOT_PASSWORD: minioadmin
+  MYSQL_ROOT_PASSWORD: root
+  BUCKET: tessera
+  DB: tessera
+
+  # MinIO server image, pinned by digest. The point of this lane is to exercise
+  # the object store's conditional-write (If-None-Match) behaviour, which Tessera
+  # relies on for correctness, so a floating tag would silently change what is
+  # being tested: MinIO RELEASE.2023-09-30 ignores If-None-Match and answers 200
+  # to every conditional PUT, whereas RELEASE.2025-04-22 honours it. Digest for
+  # minio/minio:RELEASE.2025-04-22T22-12-26Z.
+  MINIO_IMAGE: minio/minio@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e # RELEASE.2025-04-22T22-12-26Z
+  # MinIO client, used only to create the bucket and open it for anonymous reads.
+  # Pinned by digest for the same reason: bucket setup must not drift.
+  # Digest for minio/mc:RELEASE.2025-04-16T18-13-26Z.
+  MC_IMAGE: minio/mc@sha256:aead63c77f9db9107f1696fb08ecb0faeda23729cde94b0f663edf4fe09728e3 # RELEASE.2025-04-16T18-13-26Z
+
+jobs:
+  minio-conformance:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # A single arm today. Kept as a matrix so additional S3-compatible or
+        # MySQL-compatible personalities can be added without restructuring.
+        binary: ['./cmd/conformance/aws']
+
+    # MySQL coordination DB. Pinned to an exact patch release rather than "mysql:8",
+    # which floats across both 8.0.x and 8.4.x and so silently changes the server
+    # under test. MYSQL_DATABASE creates the database on first boot so the
+    # conformance server can create its tables immediately.
+    services:
+      mysql:
+        image: mysql:8.4.6
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: tessera
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=12
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Start MinIO (S3-compatible object store)
+        run: |
+          # S3 API on :9000, console on :9001. The conformance binary talks to it
+          # via --s3_endpoint using path-style addressing, which MinIO requires.
+          docker run -d --name minio \
+            -p 9000:9000 -p 9001:9001 \
+            -e "MINIO_ROOT_USER=${MINIO_ROOT_USER}" \
+            -e "MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}" \
+            "${MINIO_IMAGE}" server /data --console-address ":9001"
+
+          echo "Waiting for MinIO to become ready on http://localhost:9000 ..."
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' \
+              "http://localhost:9000/minio/health/ready" || true)
+            if [ "$code" = "200" ]; then
+              echo "MinIO is ready."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Timed out waiting for MinIO. Container logs:"
+          docker logs minio || true
+          exit 1
+
+      - name: Create log bucket
+        run: |
+          # Create the bucket and make it anonymously readable: the hammer reads
+          # the log (checkpoint, tiles, entry bundles) directly from MinIO over
+          # plain HTTP without credentials, because the conformance binary only
+          # serves POST /add. Writes still use the server's authenticated S3 client.
+          docker run --rm --network host --entrypoint /bin/sh "${MC_IMAGE}" -c "
+            mc alias set local http://localhost:9000 '${MINIO_ROOT_USER}' '${MINIO_ROOT_PASSWORD}' &&
+            mc mb 'local/${BUCKET}' &&
+            mc anonymous set download 'local/${BUCKET}'"
+          echo "Created bucket '${BUCKET}' with anonymous download access."
+
+      - name: Generate ephemeral log keys
+        run: |
+          go run github.com/transparency-dev/serverless-log/cmd/generate_keys@80334bc9dc573e8f6c5b3694efad6358da50abd4 \
+            --key_name=tessera/ci \
+            --out_priv="${{ runner.temp }}/key.sec" \
+            --out_pub="${{ runner.temp }}/key.pub"
+          echo "TESSERA_SIGNER=$(cat ${{ runner.temp }}/key.sec)" >> "$GITHUB_ENV"
+          echo "TESSERA_VERIFIER=$(cat ${{ runner.temp }}/key.pub)" >> "$GITHUB_ENV"
+
+      - name: Run conformance server (background)
+        run: |
+          # A non-empty --s3_endpoint switches the AWS SDK client onto MinIO:
+          # BaseEndpoint, static credentials from --s3_access_key/--s3_secret, and
+          # UsePathStyle. Coordination uses MySQL via the --db_* flags.
+          echo "Starting conformance server against MinIO bucket=${BUCKET} db=${DB}"
+          go run ${{ matrix.binary }} \
+            --s3_endpoint="http://localhost:9000" \
+            --s3_access_key="${MINIO_ROOT_USER}" \
+            --s3_secret="${MINIO_ROOT_PASSWORD}" \
+            --bucket="${BUCKET}" \
+            --db_host=127.0.0.1 \
+            --db_port=3306 \
+            --db_user=root \
+            --db_password="${MYSQL_ROOT_PASSWORD}" \
+            --db_name="${DB}" \
+            --signer="${TESSERA_SIGNER}" \
+            --listen=:2024 >"${{ runner.temp }}/conformance.log" 2>&1 &
+          echo "CONFORMANCE_PID=$!" >> "$GITHUB_ENV"
+
+      - name: Wait for log to be ready
+        run: |
+          # The hammer reads the log directly from MinIO, so wait until the server
+          # publishes the initial (size-0) checkpoint, confirming it can write to MinIO.
+          echo "Waiting for checkpoint at http://localhost:9000/${BUCKET}/checkpoint ..."
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' \
+              "http://localhost:9000/${BUCKET}/checkpoint")
+            if [ "$code" = "200" ]; then
+              echo "Checkpoint is available."
+              exit 0
+            fi
+            if ! kill -0 "${CONFORMANCE_PID}" 2>/dev/null; then
+              echo "Conformance server exited prematurely. Logs:"
+              cat "${{ runner.temp }}/conformance.log" || true
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "Timed out waiting for the initial checkpoint. Conformance server logs:"
+          cat "${{ runner.temp }}/conformance.log" || true
+          exit 1
+
+      - name: Run hammer
+        run: |
+          # Reads come from the (anonymous) MinIO bucket; writes go to the server's
+          # POST /add. The hammer's exit code is this job's pass/fail signal.
+          go run ./internal/hammer \
+            --log_url="http://localhost:9000/${BUCKET}/" \
+            --write_log_url="http://localhost:2024/" \
+            --log_public_key="${TESSERA_VERIFIER}" \
+            --num_writers=8 \
+            --max_write_ops=200 \
+            --num_readers_random=2 \
+            --num_readers_full=2 \
+            --leaf_min_size=512 \
+            --leaf_write_goal=1000 \
+            --max_runtime=5m \
+            --show_ui=false
+
+      - name: Dump server and MinIO logs
+        if: always()
+        run: |
+          echo "===== conformance server log ====="
+          cat "${{ runner.temp }}/conformance.log" || true
+          echo "===== MinIO container log ====="
+          docker logs minio || true
